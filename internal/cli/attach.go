@@ -125,7 +125,9 @@ func buildAdapters(repoPath string, cfg *config.Config) []adapter.Adapter {
 		case "gitlab-ci":
 			token := sig.ResolveToken()
 			interval := sig.ParsedPollInterval()
-			adapters = append(adapters, gitlabciadapter.New(sig.Repo, token, interval, sig.Watch))
+			a := gitlabciadapter.New(sig.Repo, token, interval, sig.Watch)
+			a.SetErrorPatterns(sig.ErrorPatterns)
+			adapters = append(adapters, a)
 		case "circleci":
 			token := sig.ResolveToken()
 			interval := sig.ParsedPollInterval()

@@ -130,7 +130,7 @@ func New(db *store.DB, workspace *store.Workspace, cfg *config.Config, repoPath 
 		workspace:  workspace,
 		cfg:        cfg,
 		repoPath:   repoPath,
-		provider:   anthropic.NewAnthropicProvider(os.Getenv("ANTHROPIC_API_KEY"), ""),
+		provider:   anthropic.NewAnthropicProvider(os.Getenv("ANTHROPIC_API_KEY"), os.Getenv("ANTHROPIC_BASE_URL")),
 		embedding:  embedding,
 		memTool:    memTool,
 		dispatcher: notify.NewDispatcher(cfg.Notifications),
@@ -525,15 +525,29 @@ If everything looks good, do nothing.`, base, hash)
 		workflow, _ := sig.Payload["workflow_name"].(string)
 		sha, _ := sig.Payload["head_sha"].(string)
 		url, _ := sig.Payload["html_url"].(string)
-		return fmt.Sprintf(`%s
+		failedJob, _ := sig.Payload["failed_job"].(string)
+		jobLog, _ := sig.Payload["job_log"].(string)
+		changedFiles, _ := sig.Payload["changed_files"].(string)
+		commitDiff, _ := sig.Payload["commit_diff"].(string)
+		msg := fmt.Sprintf(`%s
 
 A CI run failed in %s:
 Workflow: %s
 Commit: %s
-Run URL: %s
-
-Investigate why the CI failed. Check recent changes, read failing test output if accessible,
-and fix the root cause. Run tests locally to verify your fix before committing.`, base, sig.Source, workflow, sha, url)
+Run URL: %s`, base, sig.Source, workflow, sha, url)
+		if failedJob != "" {
+			msg += fmt.Sprintf("\nFailed job: %s", failedJob)
+		}
+		if jobLog != "" {
+			msg += fmt.Sprintf("\n\nCI error output:\n%s", jobLog)
+		}
+		if commitDiff != "" {
+			msg += fmt.Sprintf("\n\nCommit diff:\n%s", commitDiff)
+		} else if changedFiles != "" {
+			msg += fmt.Sprintf("\n\nChanged files: %s", changedFiles)
+		}
+		msg += "\n\nUse the error output and diff above to identify the root cause. Fix it and run tests locally to verify before committing."
+		return msg
 
 	case adapter.SignalScheduleTick:
 		return fmt.Sprintf(`%s
@@ -651,7 +665,13 @@ func userMessage(sig adapter.Signal) string {
 	case adapter.SignalCIFailure:
 		workflow, _ := sig.Payload["workflow_name"].(string)
 		sha, _ := sig.Payload["head_sha"].(string)
-		return fmt.Sprintf("CI failure in workflow %q on commit %s. Investigate and fix.", workflow, sha)
+		failedJob, _ := sig.Payload["failed_job"].(string)
+		msg := fmt.Sprintf("CI failure in workflow %q on commit %s.", workflow, sha)
+		if failedJob != "" {
+			msg += fmt.Sprintf(" Failed job: %s.", failedJob)
+		}
+		msg += " Investigate and fix."
+		return msg
 	case adapter.SignalScheduleTick:
 		return "Proactive sweep: identify and apply one meaningful improvement."
 	case adapter.SignalLogAnomaly:
