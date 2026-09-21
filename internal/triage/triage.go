@@ -107,8 +107,25 @@ func BuildTriageMessage(sig adapter.Signal) string {
 		url, _ := sig.Payload["html_url"].(string)
 		repo, _ := sig.Payload["repo"].(string)
 		isFlake, _ := sig.Payload["is_flake"].(bool)
-		return fmt.Sprintf("CI failure in %s:\nWorkflow: %s\nConclusion: %s\nCommit: %s\nURL: %s\nRepo: %s\nFlaky: %v\n\nShould this be fixed automatically?",
+		failedJob, _ := sig.Payload["failed_job"].(string)
+		jobLog, _ := sig.Payload["job_log"].(string)
+		changedFiles, _ := sig.Payload["changed_files"].(string)
+		msg := fmt.Sprintf("CI failure in %s:\nWorkflow: %s\nConclusion: %s\nCommit: %s\nURL: %s\nRepo: %s\nFlaky: %v",
 			sig.Source, workflow, conclusion, sha, url, repo, isFlake)
+		if failedJob != "" {
+			msg += fmt.Sprintf("\nFailed job: %s", failedJob)
+		}
+		if changedFiles != "" {
+			msg += fmt.Sprintf("\nChanged files: %s", changedFiles)
+		}
+		if isFlake {
+			msg += "\n\nNote: This appears to be a flaky/intermittent failure based on recent pipeline history."
+		}
+		if jobLog != "" {
+			msg += fmt.Sprintf("\n\nCI error output:\n%s", jobLog)
+		}
+		msg += "\n\nShould this be fixed automatically?"
+		return msg
 	case adapter.SignalGitCommit:
 		hash, _ := sig.Payload["hash"].(string)
 		return fmt.Sprintf("New git commit: %s\nShould this commit be reviewed and fixed if it introduced issues?", hash)

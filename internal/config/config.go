@@ -177,9 +177,10 @@ type SignalConfig struct {
 	Repo         string              `yaml:"repo"`          // owner/repo slug (github-ci adapter)
 	Token        string              `yaml:"token"`         // literal or $ENV_VAR reference
 	PollInterval string              `yaml:"poll_interval"` // e.g. "60s", default "60s"
-	Logs         LogsSignalConfig    `yaml:"logs"`
-	Metrics      MetricsSignalConfig `yaml:"metrics"`
-	Uptime       UptimeSignalConfig  `yaml:"uptime"`
+	ErrorPatterns []string            `yaml:"error_patterns"` // extra patterns for CI log extraction
+	Logs          LogsSignalConfig    `yaml:"logs"`
+	Metrics       MetricsSignalConfig `yaml:"metrics"`
+	Uptime        UptimeSignalConfig  `yaml:"uptime"`
 }
 
 type AutonomyPolicy struct {
