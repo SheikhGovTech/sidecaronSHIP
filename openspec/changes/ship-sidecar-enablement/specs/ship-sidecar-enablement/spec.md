@@ -9,12 +9,25 @@ single capability spec, including core workflow, adapters, PostgreSQL storage,
 triage, autonomy, memory, notifications, uptime diagnostics, worktree and
 evaluator safety, skills, budgets, demo applications, and CLI behavior.
 
+#### Scenario: Fork capability documentation
+
+- **WHEN** an operator evaluates the SHIP-enabled fork
+- **THEN** the capability spec identifies the implemented behavior and its
+  operational boundaries
+
 ### Requirement: SHIP-HATS configuration
 
 The GitLab adapter SHALL default to `https://sgts.gitlab-dedicated.com`, and
 the LLM provider SHALL honor `ANTHROPIC_BASE_URL` while preserving its default
 when unset. GitLab CI error patterns SHALL be configurable through
 `error_patterns`.
+
+#### Scenario: SHIP-HATS deployment configuration
+
+- **WHEN** a deployment configures a compatible model endpoint and GitLab
+  failure patterns
+- **THEN** Sidecar uses that endpoint and applies those patterns during GitLab
+  CI enrichment
 
 ### Requirement: Enriched CI failure context
 
@@ -27,6 +40,12 @@ Missing API data SHALL degrade to empty optional fields.
 Triage SHALL receive failed-job, log, changed-file, and flake context. The
 coding agent SHALL receive job logs and the commit diff or changed-file list,
 plus the failed job name when available.
+
+#### Scenario: Failed GitLab pipeline
+
+- **WHEN** GitLab reports a failed pipeline with accessible job and commit data
+- **THEN** the emitted signal contains bounded failed-job logs and available
+  changed-file or diff context for triage and coding
 
 ### Requirement: Restart-safe signal deduplication
 
@@ -41,6 +60,11 @@ key before task creation or LLM use.
 - Dedup lookup errors SHALL fail open with a warning.
 - The unique index SHALL prevent concurrent duplicate task insertion.
 
+#### Scenario: Pipeline signal is replayed after restart
+
+- **WHEN** a CI failure signal has a signal key already stored for the workspace
+- **THEN** Sidecar skips it before task creation and model usage
+
 ### Requirement: Backward compatibility
 
 Migrations SHALL be idempotent and additive. Existing tasks SHALL remain valid
@@ -48,10 +72,15 @@ with `NULL` signal keys, and existing routing, autonomy, adapter, triage,
 evaluator, output, and CLI behavior SHALL remain compatible except where this
 spec explicitly adds context or deduplication.
 
+#### Scenario: Existing database is upgraded
+
+- **WHEN** the schema is applied to a database containing existing tasks
+- **THEN** the migration succeeds idempotently and existing rows retain a
+  nullable signal key
+
 ## Verification status
 
 Unit and integration test source coverage exists for signal-key derivation,
 store lookup/uniqueness/null behavior, duplicate CI signals, and
-non-deduplicated schedule ticks. Full execution still requires the missing
-`../harness` module and, for database tests, `SIDECAR_TEST_DB_URL`. Live
-deployment verification remains outstanding.
+non-deduplicated schedule ticks. Database integration tests require
+`SIDECAR_TEST_DB_URL`. Live deployment verification remains outstanding.
