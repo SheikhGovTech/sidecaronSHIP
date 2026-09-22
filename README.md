@@ -4,6 +4,20 @@
 
 An autonomous engineering agent that attaches to any software project as a persistent sidecar process and continuously maintains it. Sidecar watches for signals (git commits, CI failures, scheduled sweeps, log anomalies, metric alerts, uptime checks), triages each one, and applies the appropriate fix — committing directly, opening a PR, recording a suggestion, or notifying a human — based on your configured autonomy level. Before any change ships, an independent adversarial evaluator runs the tests over the diff and can veto it.
 
+## Upstream Contribution Status
+
+The capabilities developed in this fork have been submitted to the parent
+project as three independently reviewable pull requests:
+
+- [GitLab CI enrichment and restart-safe signal deduplication](https://github.com/sausheong/sidecar/pull/1)
+- [Compatible AI gateways and Cohere embeddings](https://github.com/sausheong/sidecar/pull/2)
+- [Deterministic verification and GitHub/GitLab change delivery](https://github.com/sausheong/sidecar/pull/3)
+
+Until these changes are merged and released upstream, this fork remains the
+reference implementation for SHIP-HATS deployments. Detailed deployment
+context is available in [SHIP-HATS.md](SHIP-HATS.md), with feature contracts
+under [`openspec/changes`](openspec/changes/).
+
 ## How It Works
 
 ```
