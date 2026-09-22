@@ -83,6 +83,49 @@ type UsageTotals struct {
 	Output int
 }
 
+// SignalKey returns the persistent idempotency key for signals that represent
+// a naturally unique event. Signals without a stable identity are not deduped.
+func SignalKey(sig adapter.Signal) string {
+	switch sig.Type {
+	case adapter.SignalCIFailure:
+		if id := signalValue(sig.Payload, "pipeline_id"); id != "" {
+			return "ci.failure:" + id
+		}
+		if id := signalValue(sig.Payload, "run_id"); id != "" {
+			return "ci.failure:" + id
+		}
+	case adapter.SignalGitCommit:
+		if hash := signalValue(sig.Payload, "hash"); hash != "" {
+			return "git.commit:" + hash
+		}
+	}
+	return ""
+}
+
+func signalValue(payload map[string]any, field string) string {
+	if payload == nil || payload[field] == nil {
+		return ""
+	}
+	switch v := payload[field].(type) {
+	case string:
+		return v
+	case int:
+		return fmt.Sprint(v)
+	case int64:
+		return fmt.Sprint(v)
+	case int32:
+		return fmt.Sprint(v)
+	case uint:
+		return fmt.Sprint(v)
+	case uint64:
+		return fmt.Sprint(v)
+	case float64:
+		return fmt.Sprintf("%.0f", v)
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
 // Total returns the combined input+output tokens.
 func (u UsageTotals) Total() int { return u.Input + u.Output }
 
@@ -145,10 +188,23 @@ func New(db *store.DB, workspace *store.Workspace, cfg *config.Config, repoPath 
 //  4. Routes output to suggestion, PR, or auto-commit based on triage result.
 //  5. Updates task status in the database.
 func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
+	key := SignalKey(sig)
+	if key != "" {
+		exists, err := l.db.TaskExistsBySignalKey(ctx, l.workspace.ID, key)
+		if err != nil {
+			slog.Warn("signal dedup check failed; allowing run (fail open)", "err", err, "signal_key", key)
+		} else if exists {
+			slog.Info("sidecar skipping duplicate signal", "signal_key", key)
+			return nil
+		}
+	}
 	task := &store.Task{
 		WorkspaceID: l.workspace.ID,
 		SignalType:  string(sig.Type),
 		Summary:     summarize(sig),
+	}
+	if key != "" {
+		task.SignalKey = &key
 	}
 	if err := l.db.CreateTask(ctx, task); err != nil {
 		return fmt.Errorf("creating task: %w", err)

@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS signal_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS tasks_workspace_signal_key_unique
+    ON tasks (workspace_id, signal_key) WHERE signal_key IS NOT NULL;
 
 -- task_events records each action taken during a task run.
 -- Used by Phase 3 workspace memory to build episodic knowledge.

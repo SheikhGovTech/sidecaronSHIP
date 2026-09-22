@@ -50,12 +50,12 @@ These changes are structured for an upstream PR to [sausheong/sidecar](https://g
 
 ## Specs
 
-This fork follows [OpenSpec](https://openspec.dev) spec-driven development. Testable specifications are maintained in the deployment repo at `openspec/changes/sidecar-gitlab-enrichment/`:
+This fork follows [OpenSpec](https://openspec.dev) spec-driven development. The consolidated specification is maintained at `openspec/changes/ship-sidecar-enablement/`:
 
-- `specs/sidecar-ship/ci-signal-enrichment/spec.md` — adapter enrichment
-- `specs/sidecar-ship/ci-triage-context/spec.md` — triage prompt
-- `specs/sidecar-ship/ci-agent-context/spec.md` — coding agent prompts
-- `specs/sidecar-ship/ship-hats-config/spec.md` — SHIP-HATS configuration
+- [`proposal.md`](openspec/changes/ship-sidecar-enablement/proposal.md) — scope and motivation
+- [`design.md`](openspec/changes/ship-sidecar-enablement/design.md) — architecture and key decisions
+- [`spec.md`](openspec/changes/ship-sidecar-enablement/specs/ship-sidecar-enablement/spec.md) — consolidated requirements
+- [`tasks.md`](openspec/changes/ship-sidecar-enablement/tasks.md) — implementation and verification status
 
 ## Deployment
 

@@ -1,6 +1,6 @@
 # Sidecar (SHIP-HATS Fork)
 
-> **This is a fork of [sausheong/sidecar](https://github.com/sausheong/sidecar)** with GitLab SHIP-HATS CI signal enrichment. See [SHIP-HATS.md](SHIP-HATS.md) for what changed and why. Specs at [openspec/changes/sidecar-gitlab-enrichment/](openspec/changes/sidecar-gitlab-enrichment/).
+> **This is a fork of [sausheong/sidecar](https://github.com/sausheong/sidecar)** with GitLab SHIP-HATS CI signal enrichment. See [SHIP-HATS.md](SHIP-HATS.md) for what changed and why. The consolidated OpenSpec is [ship-sidecar-enablement](openspec/changes/ship-sidecar-enablement/).
 
 An autonomous engineering agent that attaches to any software project as a persistent sidecar process and continuously maintains it. Sidecar watches for signals (git commits, CI failures, scheduled sweeps, log anomalies, metric alerts, uptime checks), triages each one, and applies the appropriate fix — committing directly, opening a PR, recording a suggestion, or notifying a human — based on your configured autonomy level. Before any change ships, an independent adversarial evaluator runs the tests over the diff and can veto it.
 

@@ -15,6 +15,7 @@ type Task struct {
 	SignalType  string
 	Status      string
 	Summary     string
+	SignalKey   *string
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
@@ -24,10 +25,10 @@ func (db *DB) CreateTask(ctx context.Context, t *Task) error {
 		t.Status = "pending"
 	}
 	row := db.pool.QueryRow(ctx, `
-		INSERT INTO tasks (workspace_id, signal_type, status, summary)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO tasks (workspace_id, signal_type, status, summary, signal_key)
+		VALUES ($1, $2, $3, $4, $5)
 		RETURNING id, created_at, updated_at`,
-		t.WorkspaceID, t.SignalType, t.Status, t.Summary,
+		t.WorkspaceID, t.SignalType, t.Status, t.Summary, t.SignalKey,
 	)
 	return row.Scan(&t.ID, &t.CreatedAt, &t.UpdatedAt)
 }
@@ -46,7 +47,7 @@ func (db *DB) UpdateTaskStatus(ctx context.Context, id uuid.UUID, status string)
 
 func (db *DB) ListTasks(ctx context.Context, workspaceID uuid.UUID, limit int) ([]*Task, error) {
 	rows, err := db.pool.Query(ctx, `
-		SELECT id, workspace_id, signal_type, status, summary, created_at, updated_at
+		SELECT id, workspace_id, signal_type, status, summary, signal_key, created_at, updated_at
 		FROM tasks
 		WHERE workspace_id = $1
 		ORDER BY created_at DESC
@@ -60,12 +61,27 @@ func (db *DB) ListTasks(ctx context.Context, workspaceID uuid.UUID, limit int) (
 	for rows.Next() {
 		t := &Task{}
 		if err := rows.Scan(&t.ID, &t.WorkspaceID, &t.SignalType, &t.Status,
-			&t.Summary, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			&t.Summary, &t.SignalKey, &t.CreatedAt, &t.UpdatedAt); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
 	}
 	return tasks, rows.Err()
+}
+
+// TaskExistsBySignalKey reports whether a task with key exists in the workspace.
+// Empty keys are intentionally never deduplicated.
+func (db *DB) TaskExistsBySignalKey(ctx context.Context, workspaceID uuid.UUID, key string) (bool, error) {
+	if key == "" {
+		return false, nil
+	}
+	var exists bool
+	err := db.pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM tasks WHERE workspace_id = $1 AND signal_key = $2)`, workspaceID, key).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("checking task signal key: %w", err)
+	}
+	return exists, nil
 }
 
 // AppendTaskEvent records a single event for a task in the task_events table.

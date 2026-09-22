@@ -105,6 +105,52 @@ func TestTask_CreateAndList(t *testing.T) {
 	assert.Equal(t, "completed", tasks[0].Status)
 }
 
+func TestTaskExistsBySignalKey(t *testing.T) {
+	db, err := store.Connect(context.Background(), dbURL(t))
+	require.NoError(t, err)
+	defer db.Close()
+	require.NoError(t, store.Migrate(context.Background(), db))
+	ws := &store.Workspace{Name: "dedup-exists", Path: t.TempDir(), ConfigHash: "x"}
+	require.NoError(t, db.UpsertWorkspace(context.Background(), ws))
+
+	found, err := db.TaskExistsBySignalKey(context.Background(), ws.ID, "ci.failure:1001")
+	require.NoError(t, err)
+	assert.False(t, found)
+	key := "ci.failure:1001"
+	require.NoError(t, db.CreateTask(context.Background(), &store.Task{WorkspaceID: ws.ID, SignalType: "ci.failure", SignalKey: &key}))
+	found, err = db.TaskExistsBySignalKey(context.Background(), ws.ID, key)
+	require.NoError(t, err)
+	assert.True(t, found)
+	found, err = db.TaskExistsBySignalKey(context.Background(), ws.ID, "")
+	require.NoError(t, err)
+	assert.False(t, found)
+}
+
+func TestCreateTask_DuplicateSignalKey(t *testing.T) {
+	db, err := store.Connect(context.Background(), dbURL(t))
+	require.NoError(t, err)
+	defer db.Close()
+	require.NoError(t, store.Migrate(context.Background(), db))
+	ws := &store.Workspace{Name: "dedup-unique", Path: t.TempDir(), ConfigHash: "x"}
+	require.NoError(t, db.UpsertWorkspace(context.Background(), ws))
+	key := "git.commit:abc123"
+	require.NoError(t, db.CreateTask(context.Background(), &store.Task{WorkspaceID: ws.ID, SignalType: "git.commit", SignalKey: &key}))
+	err = db.CreateTask(context.Background(), &store.Task{WorkspaceID: ws.ID, SignalType: "git.commit", SignalKey: &key})
+	assert.Error(t, err)
+}
+
+func TestCreateTask_NilSignalKey_NoDedupConflict(t *testing.T) {
+	db, err := store.Connect(context.Background(), dbURL(t))
+	require.NoError(t, err)
+	defer db.Close()
+	require.NoError(t, store.Migrate(context.Background(), db))
+	ws := &store.Workspace{Name: "dedup-null", Path: t.TempDir(), ConfigHash: "x"}
+	require.NoError(t, db.UpsertWorkspace(context.Background(), ws))
+	for range 2 {
+		require.NoError(t, db.CreateTask(context.Background(), &store.Task{WorkspaceID: ws.ID, SignalType: "schedule.tick"}))
+	}
+}
+
 func TestTaskEvent_Append(t *testing.T) {
 	db, err := store.Connect(context.Background(), dbURL(t))
 	require.NoError(t, err)
