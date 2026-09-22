@@ -21,6 +21,7 @@ func initRepoWithRemote(t *testing.T) (localPath, remotePath string) {
 
 	local := t.TempDir()
 	runGit(t, local, "clone", remote, ".")
+	runGit(t, local, "checkout", "-b", "master")
 	runGit(t, local, "config", "user.email", "test@test.com")
 	runGit(t, local, "config", "user.name", "Test")
 	runGit(t, local, "commit", "--allow-empty", "-m", "initial")

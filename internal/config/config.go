@@ -113,8 +113,11 @@ func (n NotificationConfig) ResolveURL() string {
 }
 
 type EmbeddingConfig struct {
-	Provider string `yaml:"provider"` // "openai" | "voyage"; empty = disabled
-	Model    string `yaml:"model"`    // optional; uses provider default if empty
+	Provider   string `yaml:"provider"`    // "openai" | "voyage" | "cohere"
+	Model      string `yaml:"model"`       // provider model, optional
+	BaseURL    string `yaml:"base_url"`    // optional compatible gateway endpoint
+	APIKeyEnv  string `yaml:"api_key_env"` // env var containing provider credential
+	Dimensions int    `yaml:"dimensions"`  // default 1024
 }
 
 type LogsSignalConfig struct {
@@ -124,8 +127,12 @@ type LogsSignalConfig struct {
 	Rate      LogRateConfig `yaml:"rate"`
 }
 
-type LogFile    struct{ Path    string `yaml:"path"` }
-type LogProcess struct{ Command string `yaml:"command"` }
+type LogFile struct {
+	Path string `yaml:"path"`
+}
+type LogProcess struct {
+	Command string `yaml:"command"`
+}
 
 type LogPattern struct {
 	Match       string `yaml:"match"`
@@ -171,12 +178,12 @@ type WorkspaceConfig struct {
 }
 
 type SignalConfig struct {
-	Adapter      string              `yaml:"adapter"`
-	Watch        []string            `yaml:"watch"`
-	Cron         string              `yaml:"cron"`
-	Repo         string              `yaml:"repo"`          // owner/repo slug (github-ci adapter)
-	Token        string              `yaml:"token"`         // literal or $ENV_VAR reference
-	PollInterval string              `yaml:"poll_interval"` // e.g. "60s", default "60s"
+	Adapter       string              `yaml:"adapter"`
+	Watch         []string            `yaml:"watch"`
+	Cron          string              `yaml:"cron"`
+	Repo          string              `yaml:"repo"`           // owner/repo slug (github-ci adapter)
+	Token         string              `yaml:"token"`          // literal or $ENV_VAR reference
+	PollInterval  string              `yaml:"poll_interval"`  // e.g. "60s", default "60s"
 	ErrorPatterns []string            `yaml:"error_patterns"` // extra patterns for CI log extraction
 	Logs          LogsSignalConfig    `yaml:"logs"`
 	Metrics       MetricsSignalConfig `yaml:"metrics"`

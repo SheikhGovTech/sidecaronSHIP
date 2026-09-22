@@ -384,8 +384,10 @@ Sidecar runs migrations automatically on `attach`.
 |----------|----------|-------------|
 | `SIDECAR_DB_URL` | Always | PostgreSQL connection string |
 | `ANTHROPIC_API_KEY` | Always | Claude API key |
+| `ANTHROPIC_BASE_URL` | Optional | Anthropic-compatible gateway endpoint |
 | `OPENAI_API_KEY` | When `embedding.provider: openai` | OpenAI embeddings |
 | `VOYAGE_API_KEY` | When `embedding.provider: voyage` | Voyage AI embeddings |
+| `COHERE_API_KEY` | When `embedding.provider: cohere` | Cohere embeddings |
 | `GITHUB_TOKEN` | For GitHub CI adapter / PR creation | GitHub personal access token |
 | `GITLAB_TOKEN` | For GitLab CI adapter | GitLab personal access token |
 | `CIRCLECI_TOKEN` | For CircleCI adapter | CircleCI API token |
@@ -533,8 +535,12 @@ models:
 
 # Embedding for persistent memory (optional but recommended)
 embedding:
-  provider: openai        # "openai" | "voyage"
+  provider: openai        # "openai" | "voyage" | "cohere"
   model: text-embedding-3-small
+  # Optional compatible gateway settings:
+  # base_url: https://gateway.example/platform/models
+  # api_key_env: PAI_TOKEN
+  # dimensions: 1024
 
 # Notifications — fired on task events (and for the `notify` autonomy level)
 notifications:
