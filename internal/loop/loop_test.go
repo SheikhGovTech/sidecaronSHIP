@@ -52,6 +52,29 @@ func TestGateAllowsCommit(t *testing.T) {
 	assert.False(t, loop.GateAllowsCommit(evaluate.Verdict{Pass: true}, errors.New("boom")))
 }
 
+func TestSignalKey(t *testing.T) {
+	tests := []struct {
+		name string
+		sig  adapter.Signal
+		want string
+	}{
+		{"ci pipeline", adapter.Signal{Type: adapter.SignalCIFailure, Payload: map[string]any{"pipeline_id": int64(1001)}}, "ci.failure:1001"},
+		{"ci run", adapter.Signal{Type: adapter.SignalCIFailure, Payload: map[string]any{"run_id": int64(5555)}}, "ci.failure:5555"},
+		{"git commit", adapter.Signal{Type: adapter.SignalGitCommit, Payload: map[string]any{"hash": "abc123"}}, "git.commit:abc123"},
+		{"missing ci id", adapter.Signal{Type: adapter.SignalCIFailure, Payload: map[string]any{}}, ""},
+		{"schedule", adapter.Signal{Type: adapter.SignalScheduleTick}, ""},
+		{"on demand", adapter.Signal{Type: adapter.SignalOnDemand}, ""},
+		{"log", adapter.Signal{Type: adapter.SignalLogAnomaly}, ""},
+		{"metric", adapter.Signal{Type: adapter.SignalMetricAlert}, ""},
+		{"uptime", adapter.Signal{Type: adapter.SignalUptimeFailure}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, loop.SignalKey(tt.sig))
+		})
+	}
+}
+
 func TestBuildSystemPrompt_GitCommit(t *testing.T) {
 	sig := adapter.Signal{
 		Type:    adapter.SignalGitCommit,

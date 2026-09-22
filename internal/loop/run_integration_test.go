@@ -229,3 +229,25 @@ func TestRun_BudgetExceededSkips(t *testing.T) {
 	require.NoError(t, l.Run(context.Background(), gitCommitSignal()))
 	assert.Equal(t, loop.StatusSkipped, lastStatus(t, db, ws))
 }
+
+func TestRun_DuplicateSignalSkipped(t *testing.T) {
+	repo := initRepo(t)
+	l, db, ws := newLoop(t, repo, &scriptedProvider{evalPass: true}, bugFixCfg())
+	sig := adapter.Signal{Type: adapter.SignalCIFailure, Source: "ci", Payload: map[string]any{"pipeline_id": int64(1001)}}
+	require.NoError(t, l.Run(context.Background(), sig))
+	require.NoError(t, l.Run(context.Background(), sig))
+	tasks, err := db.ListTasks(context.Background(), ws.ID, 10)
+	require.NoError(t, err)
+	assert.Len(t, tasks, 1)
+}
+
+func TestRun_ScheduleTickNotDeduped(t *testing.T) {
+	repo := initRepo(t)
+	l, db, ws := newLoop(t, repo, &scriptedProvider{evalPass: true}, bugFixCfg())
+	sig := adapter.Signal{Type: adapter.SignalScheduleTick, Source: "schedule"}
+	require.NoError(t, l.Run(context.Background(), sig))
+	require.NoError(t, l.Run(context.Background(), sig))
+	tasks, err := db.ListTasks(context.Background(), ws.ID, 10)
+	require.NoError(t, err)
+	assert.Len(t, tasks, 2)
+}
