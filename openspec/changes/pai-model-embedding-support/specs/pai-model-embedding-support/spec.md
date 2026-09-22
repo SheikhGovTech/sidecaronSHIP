@@ -25,6 +25,11 @@ the endpoint is unset, existing provider defaults SHALL remain unchanged.
 The provider SHALL pass model identifiers such as `bedrock.claude-sonnet-4-5`
 unchanged to the compatible endpoint.
 
+#### Scenario: Gateway model identifier
+
+- **WHEN** a model name uses a gateway-specific prefix such as `bedrock.`
+- **THEN** Sidecar sends the exact configured identifier without rewriting it
+
 ### Requirement: PAi-compatible embeddings
 
 The embedding layer SHALL support an OpenAI-compatible `/v1/embeddings`
@@ -67,14 +72,31 @@ The project SHALL document endpoint, credential, provider, model, dimension,
 and input-type configuration and SHALL provide unit tests for request routing,
 authentication, model propagation, response parsing, and dimension handling.
 
+#### Scenario: Operator configures a compatible gateway
+
+- **WHEN** an operator follows the documented endpoint, credential, model, and
+  dimension configuration
+- **THEN** unit-tested request behavior matches the documented contract
+
 ### Requirement: No database migration for provider support
 
 The change SHALL not require a database migration for supported 1024-dimensional
 providers. Providers returning another dimension SHALL be rejected or handled
 explicitly rather than writing vectors incompatible with `vector(1024)`.
 
+#### Scenario: Supported vector dimension
+
+- **WHEN** a configured provider returns 1024-dimensional vectors
+- **THEN** Sidecar stores them using the existing schema without a migration
+
 ### Requirement: Downstream overlay removal path
 
 After the upstream capability is merged and adopted, downstream deployments
 SHALL be able to remove their local `cohere.go` and `embedding.go` Docker
 overlays without losing provider functionality.
+
+#### Scenario: Deployment adopts upstream provider support
+
+- **WHEN** a downstream deployment upgrades to this capability
+- **THEN** it can use PAi Cohere embeddings without replacing Sidecar source
+  files during its image build
