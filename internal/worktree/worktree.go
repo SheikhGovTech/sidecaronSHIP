@@ -60,3 +60,16 @@ func Create(repoPath, taskID string) (*Worktree, func() error, error) {
 	}
 	return wt, cleanup, nil
 }
+
+// DeleteBranch removes an ephemeral Sidecar task branch after a failed run.
+// It refuses non-Sidecar branch names as a guard against accidental deletion.
+func DeleteBranch(repoPath, branch string) error {
+	if !strings.HasPrefix(branch, "sidecar/") {
+		return fmt.Errorf("refusing to delete non-sidecar branch %q", branch)
+	}
+	out, err := exec.Command("git", "-C", repoPath, "branch", "-D", "--", branch).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git branch delete: %w\n%s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}

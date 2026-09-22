@@ -103,7 +103,7 @@ func TestSignalConfig_ParsedPollInterval(t *testing.T) {
 
 func TestSignalConfig_ResolveToken(t *testing.T) {
 	t.Setenv("MY_TEST_TOKEN", "secret123")
-	assert.Equal(t, "secret123", config.SignalConfig{Token: "$MY_TEST_TOKEN"}.ResolveToken()) // env var
+	assert.Equal(t, "secret123", config.SignalConfig{Token: "$MY_TEST_TOKEN"}.ResolveToken())    // env var
 	assert.Equal(t, "literal-token", config.SignalConfig{Token: "literal-token"}.ResolveToken()) // literal
 	assert.Equal(t, "", config.SignalConfig{Token: ""}.ResolveToken())                           // empty
 }
@@ -151,6 +151,52 @@ func TestVerificationEnabled_RespectsExplicitTrue(t *testing.T) {
 	tr := true
 	cfg := &config.Config{Verification: config.VerificationConfig{Enabled: &tr}}
 	assert.True(t, cfg.VerificationEnabled())
+}
+
+func TestLoad_VerificationCommandsAndDefaults(t *testing.T) {
+	yaml := `
+verification:
+  enabled: true
+  commands:
+    - name: backend-tests
+      run: go test ./...
+      required_tools: [go]
+      working_directory: backend
+      pass_env: [PATH, HOME]
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sidecar.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+
+	cfg, err := config.Load(path)
+	require.NoError(t, err)
+	require.Len(t, cfg.Verification.Commands, 1)
+	cmd := cfg.Verification.Commands[0]
+	assert.Equal(t, config.DefaultVerificationTimeout, cmd.ParsedTimeout())
+	assert.Equal(t, "backend", cmd.WorkingDirectory)
+	assert.Equal(t, []string{"go"}, cmd.RequiredTools)
+}
+
+func TestValidateVerificationRejectsInvalidCommands(t *testing.T) {
+	tests := map[string][]config.VerificationCommand{
+		"empty name":      {{Run: "true"}},
+		"blank name":      {{Name: "  ", Run: "true"}},
+		"empty run":       {{Name: "test"}},
+		"duplicate name":  {{Name: "test", Run: "true"}, {Name: "test", Run: "true"}},
+		"bad duration":    {{Name: "test", Run: "true", Timeout: "forever"}},
+		"too long":        {{Name: "test", Run: "true", Timeout: "31m"}},
+		"absolute path":   {{Name: "test", Run: "true", WorkingDirectory: "/tmp"}},
+		"parent path":     {{Name: "test", Run: "true", WorkingDirectory: "../outside"}},
+		"embedded parent": {{Name: "test", Run: "true", WorkingDirectory: "backend/../frontend"}},
+		"tool path":       {{Name: "test", Run: "true", RequiredTools: []string{"/bin/go"}}},
+		"invalid env":     {{Name: "test", Run: "true", PassEnv: []string{"A=B"}}},
+	}
+	for name, commands := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg := &config.Config{Verification: config.VerificationConfig{Commands: commands}}
+			assert.Error(t, cfg.ValidateVerification())
+		})
+	}
 }
 
 func TestSkillsDir_DefaultWhenEmpty(t *testing.T) {

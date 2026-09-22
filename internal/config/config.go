@@ -3,6 +3,8 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -21,11 +23,86 @@ type Config struct {
 	Budget        BudgetConfig         `yaml:"budget"`
 }
 
-// VerificationConfig controls the adversarial evaluator gate.
+// VerificationConfig controls deterministic commands and the adversarial
+// evaluator gate. When Enabled is false, both are disabled.
 type VerificationConfig struct {
 	// Enabled gates auto-commit and pull-request changes behind the
 	// evaluator. Pointer so an absent value defaults to true.
-	Enabled *bool `yaml:"enabled"`
+	Enabled  *bool                 `yaml:"enabled"`
+	Commands []VerificationCommand `yaml:"commands"`
+}
+
+type VerificationCommand struct {
+	Name             string   `yaml:"name"`
+	Run              string   `yaml:"run"`
+	RequiredTools    []string `yaml:"required_tools"`
+	Timeout          string   `yaml:"timeout"`
+	WorkingDirectory string   `yaml:"working_directory"`
+	PassEnv          []string `yaml:"pass_env"`
+}
+
+const (
+	DefaultVerificationTimeout = 10 * time.Minute
+	MaxVerificationTimeout     = 30 * time.Minute
+)
+
+func (c VerificationCommand) ParsedTimeout() time.Duration {
+	if c.Timeout == "" {
+		return DefaultVerificationTimeout
+	}
+	d, err := time.ParseDuration(c.Timeout)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}
+
+func (c *Config) ValidateVerification() error {
+	seen := map[string]bool{}
+	for i, cmd := range c.Verification.Commands {
+		if strings.TrimSpace(cmd.Name) == "" {
+			return fmt.Errorf("verification command %d: name is required", i)
+		}
+		if seen[cmd.Name] {
+			return fmt.Errorf("verification command %q: duplicate name", cmd.Name)
+		}
+		seen[cmd.Name] = true
+		if strings.TrimSpace(cmd.Run) == "" {
+			return fmt.Errorf("verification command %q: run is required", cmd.Name)
+		}
+		d := cmd.ParsedTimeout()
+		if d == 0 || d > MaxVerificationTimeout {
+			return fmt.Errorf("verification command %q: timeout must be >0 and <=%s", cmd.Name, MaxVerificationTimeout)
+		}
+		wd := cmd.WorkingDirectory
+		if filepath.IsAbs(wd) {
+			return fmt.Errorf("verification command %q: working_directory must be relative", cmd.Name)
+		}
+		if wd != "" && wd != "." {
+			for _, segment := range strings.FieldsFunc(wd, func(r rune) bool {
+				return r == '/' || r == '\\'
+			}) {
+				if segment == ".." {
+					return fmt.Errorf("verification command %q: working_directory contains '..'", cmd.Name)
+				}
+			}
+			clean := filepath.Clean(wd)
+			if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("verification command %q: working_directory escapes workspace", cmd.Name)
+			}
+		}
+		for _, tool := range cmd.RequiredTools {
+			if strings.TrimSpace(tool) == "" || strings.TrimSpace(tool) != tool || filepath.Base(tool) != tool {
+				return fmt.Errorf("verification command %q: invalid required_tool %q", cmd.Name, tool)
+			}
+		}
+		for _, name := range cmd.PassEnv {
+			if strings.TrimSpace(name) == "" || strings.TrimSpace(name) != name || strings.Contains(name, "=") {
+				return fmt.Errorf("verification command %q: invalid pass_env name %q", cmd.Name, name)
+			}
+		}
+	}
+	return nil
 }
 
 // VerificationEnabled reports whether the evaluator gate is on. Defaults to
@@ -239,9 +316,9 @@ func ValidAutonomyLevel(s string) bool {
 	return validAutonomyLevels[s]
 }
 
-// Load reads and parses the YAML config at path. It is intentionally permissive:
-// it does not validate field values. Callers that need to validate autonomy levels
-// must call ValidAutonomyLevel separately.
+// Load reads, parses, and validates security-sensitive verification settings.
+// Other field values remain permissive; callers that need to validate autonomy
+// levels must call ValidAutonomyLevel separately.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -250,6 +327,9 @@ func Load(path string) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing config %q: %w", path, err)
+	}
+	if err := cfg.ValidateVerification(); err != nil {
+		return nil, fmt.Errorf("validating config %q: %w", path, err)
 	}
 	return &cfg, nil
 }

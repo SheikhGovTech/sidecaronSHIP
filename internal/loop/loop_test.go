@@ -63,6 +63,17 @@ func TestBuildSystemPrompt_GitCommit(t *testing.T) {
 	assert.Contains(t, prompt, "engineering agent")
 }
 
+func TestBuildSystemPromptWithContextIncludesWorkspaceAndCommands(t *testing.T) {
+	sig := adapter.Signal{Type: adapter.SignalOnDemand, Payload: map[string]any{"description": "fix tests"}}
+	prompt := loop.BuildSystemPromptWithContext(sig, "/tmp/sidecar-wt-123", []config.VerificationCommand{{
+		Name: "backend-tests", Run: "go test ./...", WorkingDirectory: ".",
+	}})
+	assert.Contains(t, prompt, "Workspace root: /tmp/sidecar-wt-123")
+	assert.Contains(t, prompt, "Use relative paths")
+	assert.Contains(t, prompt, "Do not change to or guess")
+	assert.Contains(t, prompt, "backend-tests: go test ./...")
+}
+
 func TestBuildSystemPrompt_ScheduleTick(t *testing.T) {
 	sig := adapter.Signal{
 		Type:    adapter.SignalScheduleTick,

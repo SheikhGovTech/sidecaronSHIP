@@ -3,6 +3,7 @@ package evaluate_test
 import (
 	"testing"
 
+	"github.com/sausheong/sidecar/internal/config"
 	"github.com/sausheong/sidecar/internal/evaluate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -42,4 +43,15 @@ func TestSystemPrompt_IsAdversarial(t *testing.T) {
 	sp := evaluate.SystemPrompt()
 	assert.Contains(t, sp, "BROKEN")
 	assert.Contains(t, sp, "pass")
+}
+
+func TestSystemPromptWithContextIncludesWorkspaceAndCommands(t *testing.T) {
+	prompt := evaluate.SystemPromptWithContext("/tmp/task-worktree", []config.VerificationCommand{{
+		Name: "tests", Run: "go test ./...",
+	}})
+	assert.Contains(t, prompt, "Workspace root: /tmp/task-worktree")
+	assert.Contains(t, prompt, "Do not change to or guess")
+	assert.Contains(t, prompt, "tests: go test ./...")
+	assert.Contains(t, prompt, "directory: .")
+	assert.Contains(t, prompt, "timeout: 10m0s")
 }

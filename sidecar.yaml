@@ -24,7 +24,15 @@ autonomy:
   uptime_fixes: notify
 
 verification:
-  enabled: true        # adversarial evaluator gates auto-commit & pull-request (default true)
+  enabled: true        # deterministic commands + evaluator gate (default true)
+  # commands run sequentially for changed auto-commit/pull-request tasks
+  # commands:
+  #   - name: tests
+  #     run: go test ./...
+  #     required_tools: [go]
+  #     timeout: 10m
+  #     working_directory: .
+  #     pass_env: [PATH, HOME]
 
 models:
   planning: anthropic/claude-sonnet-4-6

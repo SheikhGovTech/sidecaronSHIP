@@ -16,6 +16,8 @@ import (
 	"github.com/sausheong/harness/tool"
 	"github.com/sausheong/harness/tools/bash"
 	"github.com/sausheong/harness/tools/file"
+	"github.com/sausheong/sidecar/internal/config"
+	"github.com/sausheong/sidecar/internal/verification"
 )
 
 // Verdict is the evaluator's decision on a diff.
@@ -42,6 +44,24 @@ Set pass=true ONLY if every check above holds.`
 
 // SystemPrompt returns the evaluator system prompt. Exposed for tests.
 func SystemPrompt() string { return evaluatorSystemPrompt }
+
+// SystemPromptWithContext binds the evaluator to the same resolved workspace
+// and deterministic commands as the coding agent.
+func SystemPromptWithContext(workDir string, commands []config.VerificationCommand) string {
+	prompt := evaluatorSystemPrompt
+	if workDir != "" {
+		prompt += fmt.Sprintf(`
+
+Workspace root: %s
+All filesystem and Bash tools execute from this directory.
+Use relative paths. Do not change to or guess another repository path.
+Run pwd before investigating.`, workDir)
+	}
+	if block := verification.PromptBlock(commands); block != "" {
+		prompt += "\n\n" + block
+	}
+	return prompt
+}
 
 // BuildEvalMessage builds the user-turn message: the task plus the diff to judge.
 func BuildEvalMessage(taskSummary, diff string) string {
@@ -107,6 +127,12 @@ func ParseVerdict(raw string) (Verdict, error) {
 // caller can meter it toward the daily budget; usage is zero on all early
 // returns (git errors, trivial empty-diff pass, build/run errors, parse error).
 func Evaluate(ctx context.Context, provider llm.LLMProvider, model, workDir, baseRef, taskSummary string) (Verdict, llm.Usage, error) {
+	return EvaluateWithCommands(ctx, provider, model, workDir, baseRef, taskSummary, nil)
+}
+
+// EvaluateWithCommands evaluates the diff and gives the skeptic the same
+// workspace and required verification contract as the coding agent.
+func EvaluateWithCommands(ctx context.Context, provider llm.LLMProvider, model, workDir, baseRef, taskSummary string, commands []config.VerificationCommand) (Verdict, llm.Usage, error) {
 	if baseRef == "" {
 		baseRef = "HEAD"
 	}
@@ -141,7 +167,7 @@ func Evaluate(ctx context.Context, provider llm.LLMProvider, model, workDir, bas
 			Name:         "Evaluator",
 			Model:        model,
 			Workspace:    workDir,
-			SystemPrompt: evaluatorSystemPrompt,
+			SystemPrompt: SystemPromptWithContext(workDir, commands),
 			MaxTurns:     8,
 		},
 	)

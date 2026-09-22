@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/sausheong/sidecar/internal/output"
 	"github.com/sausheong/sidecar/internal/store"
 	"github.com/sausheong/sidecar/internal/triage"
+	"github.com/sausheong/sidecar/internal/verification"
 	"github.com/sausheong/sidecar/internal/worktree"
 )
 
@@ -235,15 +237,38 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 	if ShipsCode(tr.AutonomyLevel) {
 		w, cleanup, wErr := worktree.Create(l.repoPath, task.ID.String())
 		if wErr != nil {
-			slog.Warn("worktree create failed; falling back to in-repo execution", "err", wErr, "task", task.ID)
-			_ = l.db.AppendTaskEvent(ctx, task.ID, "worktree_degraded", map[string]any{"error": wErr.Error()})
+			_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
+			l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
+			return fmt.Errorf("preparing isolated workspace: %w", wErr)
 		} else {
 			wt, wtCleanup, workDir = w, cleanup, w.Path
 			defer func() {
-				if cErr := wtCleanup(); cErr != nil {
-					slog.Warn("worktree cleanup failed", "err", cErr, "task", task.ID)
+				if wtCleanup != nil {
+					if cErr := wtCleanup(); cErr != nil {
+						slog.Warn("worktree cleanup failed", "err", cErr, "task", task.ID)
+					}
 				}
 			}()
+		}
+	}
+
+	workspaceEvent := map[string]any{"kind": "attached"}
+	if wt != nil {
+		workspaceEvent = map[string]any{"kind": "worktree", "branch": wt.Branch, "base": wt.Base}
+	}
+	_ = l.db.AppendTaskEvent(ctx, task.ID, "workspace_prepared", workspaceEvent)
+
+	verificationCommands := []config.VerificationCommand(nil)
+	if ShipsCode(tr.AutonomyLevel) && l.cfg.VerificationEnabled() {
+		verificationCommands = l.cfg.Verification.Commands
+		if command, err := verification.Preflight(workDir, verificationCommands); err != nil {
+			payload := verificationEvent(verification.Result{Name: command, ExitCode: -1, Err: err})
+			payload["phase"] = "preflight"
+			_ = l.db.AppendTaskEvent(ctx, task.ID, "verification_failed", payload)
+			_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
+			l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
+			l.discardWorktree(task.ID.String(), wt, &wtCleanup)
+			return err
 		}
 	}
 
@@ -258,7 +283,7 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		reg.Register(l.memTool)
 	}
 
-	systemPrompt := BuildSystemPrompt(sig)
+	systemPrompt := BuildSystemPromptWithContext(sig, workDir, verificationCommands)
 	if memoryBlock != "" {
 		systemPrompt = memoryBlock + "\n\n" + systemPrompt
 	}
@@ -302,6 +327,8 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 	)
 	if buildErr != nil {
 		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
+		l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
+		l.discardWorktree(task.ID.String(), wt, &wtCleanup)
 		return fmt.Errorf("building runtime: %w", buildErr)
 	}
 	defer rt.Close()
@@ -309,6 +336,8 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 	events, err := rt.Run(ctx, userMessage(sig), nil)
 	if err != nil {
 		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
+		l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
+		l.discardWorktree(task.ID.String(), wt, &wtCleanup)
 		return err
 	}
 
@@ -333,10 +362,11 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 	if agentErr != nil {
 		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
 		l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
+		l.discardWorktree(task.ID.String(), wt, &wtCleanup)
 		return fmt.Errorf("agent error: %w", agentErr)
 	}
 
-	// ── Adversarial evaluation gate ──────────────────────────────────────────
+	// ── Deterministic verification and adversarial evaluation gates ─────────
 	if ShipsCode(tr.AutonomyLevel) && l.cfg.VerificationEnabled() {
 		// Anchor the diff to the worktree base ref so the evaluator sees the
 		// agent's changes even if it self-committed (HEAD would have moved).
@@ -345,35 +375,53 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		if wt != nil {
 			baseRef = wt.Base
 		}
-		verdict, evalUsage, evalErr := evaluate.Evaluate(ctx, l.provider, models.Evaluator, workDir, baseRef, task.Summary)
-		if evalErr != nil {
-			slog.Warn("evaluator error; failing closed (downgrade to suggestion)", "err", evalErr, "task", task.ID)
+		changed, changeErr := workspaceHasChanges(workDir, baseRef)
+		if changeErr != nil {
+			return l.failVerification(ctx, sig, task, wt, &wtCleanup, "change_detection", verification.Result{Err: changeErr})
 		}
-		// Record evaluator token spend even on error — the tokens were consumed.
-		if evalUsage.InputTokens+evalUsage.OutputTokens > 0 {
-			_ = l.db.AppendTaskEvent(ctx, task.ID, "usage", map[string]any{
-				"input":  evalUsage.InputTokens,
-				"output": evalUsage.OutputTokens,
-				"total":  evalUsage.InputTokens + evalUsage.OutputTokens,
-				"model":  models.Evaluator,
-				"role":   "evaluator",
+		if !changed {
+			slog.Info("sidecar: no changes; skipping verification and evaluator", "task", task.ID)
+		} else {
+			for _, command := range verificationCommands {
+				_ = l.db.AppendTaskEvent(ctx, task.ID, "verification_started", map[string]any{"command": command.Name})
+				result := verification.RunOne(ctx, workDir, command)
+				if result.Err != nil || result.ExitCode != 0 {
+					return l.failVerification(ctx, sig, task, wt, &wtCleanup, command.Name, result)
+				}
+				_ = l.db.AppendTaskEvent(ctx, task.ID, "verification_succeeded", verificationEvent(result))
+			}
+
+			verdict, evalUsage, evalErr := evaluate.EvaluateWithCommands(ctx, l.provider, models.Evaluator, workDir, baseRef, task.Summary, verificationCommands)
+			if evalErr != nil {
+				slog.Warn("evaluator error; failing closed (downgrade to suggestion)", "err", evalErr, "task", task.ID)
+			}
+			// Record evaluator token spend even on error — the tokens were consumed.
+			if evalUsage.InputTokens+evalUsage.OutputTokens > 0 {
+				_ = l.db.AppendTaskEvent(ctx, task.ID, "usage", map[string]any{
+					"input":  evalUsage.InputTokens,
+					"output": evalUsage.OutputTokens,
+					"total":  evalUsage.InputTokens + evalUsage.OutputTokens,
+					"model":  models.Evaluator,
+					"role":   "evaluator",
+				})
+			}
+			_ = l.db.AppendTaskEvent(ctx, task.ID, "evaluation", map[string]any{
+				"pass":    verdict.Pass,
+				"reasons": verdict.Reasons,
+				"model":   models.Evaluator,
+				"error":   errString(evalErr),
 			})
-		}
-		_ = l.db.AppendTaskEvent(ctx, task.ID, "evaluation", map[string]any{
-			"pass":    verdict.Pass,
-			"reasons": verdict.Reasons,
-			"model":   models.Evaluator,
-			"error":   errString(evalErr),
-		})
-		if !GateAllowsCommit(verdict, evalErr) {
-			slog.Info("evaluator rejected change; recording as suggestion", "task", task.ID, "reasons", verdict.Reasons)
-			_ = l.db.AppendTaskEvent(ctx, task.ID, "suggestion", map[string]any{
-				"summary":          textBuf.String(),
-				"rejected_reasons": verdict.Reasons,
-			})
-			_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusSuggested)
-			l.dispatcher.Fire(ctx, notify.EventSuggested, sig, task)
-			return nil
+			if !GateAllowsCommit(verdict, evalErr) {
+				slog.Info("evaluator rejected change; recording as suggestion", "task", task.ID, "reasons", verdict.Reasons)
+				_ = l.db.AppendTaskEvent(ctx, task.ID, "suggestion", map[string]any{
+					"summary":          textBuf.String(),
+					"rejected_reasons": verdict.Reasons,
+				})
+				_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusSuggested)
+				l.dispatcher.Fire(ctx, notify.EventSuggested, sig, task)
+				l.discardWorktree(task.ID.String(), wt, &wtCleanup)
+				return nil
+			}
 		}
 	}
 
@@ -418,6 +466,7 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 			slog.Info("sidecar: no changes to commit", "task", task.ID)
 			_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusCompleted)
 			l.dispatcher.Fire(ctx, notify.EventCompleted, sig, task)
+			l.discardWorktree(task.ID.String(), wt, &wtCleanup)
 			return nil
 		}
 		repo, token := l.resolveRepoAndToken(sig)
@@ -444,10 +493,70 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		}
 		if branch != output.BranchNoChanges {
 			slog.Info("sidecar committed changes", "branch", branch, "task", task.ID)
+		} else {
+			l.discardWorktree(task.ID.String(), wt, &wtCleanup)
 		}
 		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusCompleted)
 		l.dispatcher.Fire(ctx, notify.EventCompleted, sig, task)
 		return nil
+	}
+}
+
+func workspaceHasChanges(workDir, baseRef string) (bool, error) {
+	if baseRef == "" {
+		baseRef = "HEAD"
+	}
+	cmd := exec.Command("git", "-C", workDir, "diff", "--quiet", baseRef, "--")
+	if err := cmd.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return true, nil
+		}
+		return false, fmt.Errorf("checking workspace diff: %w", err)
+	}
+	status, err := exec.Command("git", "-C", workDir, "status", "--porcelain").CombinedOutput()
+	if err != nil {
+		return false, fmt.Errorf("checking workspace status: %w", err)
+	}
+	return strings.TrimSpace(string(status)) != "", nil
+}
+
+func verificationEvent(result verification.Result) map[string]any {
+	return map[string]any{
+		"command":     result.Name,
+		"exit_code":   result.ExitCode,
+		"output":      result.Output,
+		"duration_ms": result.Duration.Milliseconds(),
+		"truncated":   result.Truncated,
+		"error":       errString(result.Err),
+	}
+}
+
+func (l *Loop) failVerification(ctx context.Context, sig adapter.Signal, task *store.Task, wt *worktree.Worktree, cleanup *func() error, command string, result verification.Result) error {
+	payload := verificationEvent(result)
+	payload["command"] = command
+	_ = l.db.AppendTaskEvent(ctx, task.ID, "verification_failed", payload)
+	_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
+	l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
+	l.discardWorktree(task.ID.String(), wt, cleanup)
+	if result.Err != nil {
+		return fmt.Errorf("verification %q failed: %w", command, result.Err)
+	}
+	return fmt.Errorf("verification %q failed with exit code %d", command, result.ExitCode)
+}
+
+func (l *Loop) discardWorktree(taskID string, wt *worktree.Worktree, cleanup *func() error) {
+	if wt == nil {
+		return
+	}
+	if cleanup != nil && *cleanup != nil {
+		if err := (*cleanup)(); err != nil {
+			slog.Warn("failed to discard task worktree", "err", err, "task", taskID)
+			return
+		}
+		*cleanup = nil
+	}
+	if err := worktree.DeleteBranch(l.repoPath, wt.Branch); err != nil {
+		slog.Warn("failed to delete rejected task branch", "err", err, "task", taskID, "branch", wt.Branch)
 	}
 }
 
@@ -505,12 +614,30 @@ func (l *Loop) prBody(sig adapter.Signal, tr triage.TriageResult, taskID string)
 		string(sig.Type), summarize(sig), tr.ChangeType, taskID)
 }
 
-// BuildSystemPrompt constructs the agent system prompt based on the signal type.
+// BuildSystemPrompt constructs the signal-specific prompt without runtime
+// workspace context. Kept as a compatibility wrapper for callers and tests.
 func BuildSystemPrompt(sig adapter.Signal) string {
+	return BuildSystemPromptWithContext(sig, "", nil)
+}
+
+// BuildSystemPromptWithContext binds the agent to the resolved task workspace
+// and tells it which deterministic commands must pass before output can ship.
+func BuildSystemPromptWithContext(sig adapter.Signal, workDir string, commands []config.VerificationCommand) string {
 	base := `You are an autonomous engineering agent (Sidecar) attached to a software project.
 Your job is to improve, fix, and maintain the codebase. You have access to the filesystem and bash.
 Make targeted, minimal changes. Run tests after any code change to verify correctness.
 Only modify files relevant to the current task.`
+	if workDir != "" {
+		base += fmt.Sprintf(`
+
+Workspace root: %s
+All filesystem and Bash tools already execute from this directory.
+Use relative paths. Do not change to or guess another repository path.
+Run pwd before investigating.`, workDir)
+	}
+	if block := verification.PromptBlock(commands); block != "" {
+		base += "\n\n" + block
+	}
 
 	switch sig.Type {
 	case adapter.SignalGitCommit:

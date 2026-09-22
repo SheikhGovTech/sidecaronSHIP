@@ -59,3 +59,20 @@ func TestCreate_IsolatedDirAndBranch(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(out), "sidecar/task-123")
 }
+
+func TestDeleteBranch(t *testing.T) {
+	repo := initRepo(t)
+	wt, cleanup, err := worktree.Create(repo, "failed-task")
+	require.NoError(t, err)
+	require.NoError(t, cleanup())
+	require.NoError(t, worktree.DeleteBranch(repo, wt.Branch))
+
+	out, err := exec.Command("git", "-C", repo, "branch", "--list", wt.Branch).Output()
+	require.NoError(t, err)
+	assert.Empty(t, string(out))
+}
+
+func TestDeleteBranchRefusesNonSidecarBranch(t *testing.T) {
+	err := worktree.DeleteBranch(initRepo(t), "master")
+	assert.ErrorContains(t, err, "refusing")
+}

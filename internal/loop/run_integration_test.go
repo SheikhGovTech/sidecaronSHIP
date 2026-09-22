@@ -63,8 +63,10 @@ func initRepo(t *testing.T) string {
 // recording (AccumulateUsage / SumWorkspaceTokensSince) is exercised.
 type scriptedProvider struct {
 	llmtest.Base
-	evalPass bool // verdict returned for the evaluator turn
-	evalErr  bool // when true, the evaluator turn returns an error (fail-closed test)
+	evalPass   bool // verdict returned for the evaluator turn
+	evalErr    bool // when true, the evaluator turn returns an error (fail-closed test)
+	noChange   bool // coding completes without writing a diff
+	selfCommit bool // coding creates and commits its own change
 }
 
 // systemText returns the effective system prompt for routing. The runtime
@@ -116,6 +118,9 @@ func (p *scriptedProvider) ChatStream(_ context.Context, req llm.ChatRequest) (<
 	if strings.Contains(sys, "triage agent") {
 		return emit(`{"should_act": true, "change_type": "bug_fix", "reason": "test signal"}`), nil
 	}
+	if p.noChange {
+		return emit("no change required"), nil
+	}
 
 	// Coding role: write a file on the first turn (creating a real diff), then
 	// stop on the next turn once the tool result is in the history.
@@ -128,10 +133,13 @@ func (p *scriptedProvider) ChatStream(_ context.Context, req llm.ChatRequest) (<
 		}()
 		return ch, nil
 	}
-	tc := &llm.ToolCall{
-		ID:    "tc_write_1",
-		Name:  "write_file",
-		Input: []byte(`{"path": "sidecar_fix.txt", "content": "scripted fix\n"}`),
+	tc := &llm.ToolCall{ID: "tc_write_1", Name: "write_file", Input: []byte(`{"path": "sidecar_fix.txt", "content": "scripted fix\n"}`)}
+	if p.selfCommit {
+		tc = &llm.ToolCall{
+			ID:    "tc_commit_1",
+			Name:  "bash",
+			Input: []byte(`{"command":"printf 'scripted fix\\n' > sidecar_fix.txt && git add sidecar_fix.txt && git commit -m 'agent commit'"}`),
+		}
 	}
 	ch := make(chan llm.ChatEvent, 3)
 	go func() {
@@ -196,11 +204,24 @@ func lastStatus(t *testing.T, db *store.DB, ws *store.Workspace) string {
 
 func TestRun_PassCommits(t *testing.T) {
 	repo := initRepo(t)
-	l, db, ws := newLoop(t, repo, &scriptedProvider{evalPass: true}, bugFixCfg())
+	cfg := bugFixCfg()
+	cfg.Verification.Commands = []config.VerificationCommand{{Name: "tests", Run: "true"}}
+	l, db, ws := newLoop(t, repo, &scriptedProvider{evalPass: true}, cfg)
 	require.NoError(t, l.Run(context.Background(), gitCommitSignal()))
 	assert.Equal(t, loop.StatusCompleted, lastStatus(t, db, ws))
 	out, _ := exec.Command("git", "-C", repo, "branch", "--list", "sidecar/*").Output()
 	assert.NotEmpty(t, strings.TrimSpace(string(out)), "a sidecar branch should exist")
+	tasks, err := db.ListTasks(context.Background(), ws.ID, 1)
+	require.NoError(t, err)
+	events, err := db.GetTaskEvents(context.Background(), tasks[0].ID)
+	require.NoError(t, err)
+	var eventTypes []string
+	for _, event := range events {
+		eventTypes = append(eventTypes, event.Type)
+	}
+	assert.Contains(t, eventTypes, "workspace_prepared")
+	assert.Contains(t, eventTypes, "verification_started")
+	assert.Contains(t, eventTypes, "verification_succeeded")
 }
 
 func TestRun_RejectSuggests(t *testing.T) {
@@ -215,6 +236,70 @@ func TestRun_EvaluatorErrorFailsClosed(t *testing.T) {
 	l, db, ws := newLoop(t, repo, &scriptedProvider{evalErr: true}, bugFixCfg())
 	require.NoError(t, l.Run(context.Background(), gitCommitSignal()))
 	assert.Equal(t, loop.StatusSuggested, lastStatus(t, db, ws))
+}
+
+func TestRun_VerificationFailureFailsAndDeletesBranch(t *testing.T) {
+	repo := initRepo(t)
+	cfg := bugFixCfg()
+	cfg.Verification.Commands = []config.VerificationCommand{{Name: "tests", Run: "exit 9"}}
+	l, db, ws := newLoop(t, repo, &scriptedProvider{evalPass: true}, cfg)
+
+	err := l.Run(context.Background(), gitCommitSignal())
+	assert.ErrorContains(t, err, "verification \"tests\" failed")
+	assert.Equal(t, loop.StatusFailed, lastStatus(t, db, ws))
+	out, cmdErr := exec.Command("git", "-C", repo, "branch", "--list", "sidecar/*").Output()
+	require.NoError(t, cmdErr)
+	assert.Empty(t, strings.TrimSpace(string(out)), "failed verification must delete the task branch")
+}
+
+func TestRun_SelfCommitThenVerificationFailureDeletesBranch(t *testing.T) {
+	repo := initRepo(t)
+	cfg := bugFixCfg()
+	cfg.Verification.Commands = []config.VerificationCommand{{Name: "tests", Run: "exit 9"}}
+	l, db, ws := newLoop(t, repo, &scriptedProvider{evalPass: true, selfCommit: true}, cfg)
+
+	err := l.Run(context.Background(), gitCommitSignal())
+	assert.ErrorContains(t, err, "verification \"tests\" failed")
+	assert.Equal(t, loop.StatusFailed, lastStatus(t, db, ws))
+	out, cmdErr := exec.Command("git", "-C", repo, "branch", "--list", "sidecar/*").Output()
+	require.NoError(t, cmdErr)
+	assert.Empty(t, strings.TrimSpace(string(out)), "agent-created commit and branch must be discarded")
+}
+
+func TestRun_VerificationDisabledSkipsCommandsAndEvaluator(t *testing.T) {
+	repo := initRepo(t)
+	disabled := false
+	cfg := bugFixCfg()
+	cfg.Verification.Enabled = &disabled
+	cfg.Verification.Commands = []config.VerificationCommand{{Name: "must-not-run", Run: "exit 9"}}
+	l, db, ws := newLoop(t, repo, &scriptedProvider{evalPass: false}, cfg)
+
+	require.NoError(t, l.Run(context.Background(), gitCommitSignal()))
+	assert.Equal(t, loop.StatusCompleted, lastStatus(t, db, ws))
+}
+
+func TestRun_SuggestOnlySkipsVerification(t *testing.T) {
+	repo := initRepo(t)
+	cfg := bugFixCfg()
+	cfg.Autonomy.BugFixes = "suggest-only"
+	cfg.Verification.Commands = []config.VerificationCommand{{Name: "must-not-run", Run: "exit 9"}}
+	l, db, ws := newLoop(t, repo, &scriptedProvider{noChange: true}, cfg)
+
+	require.NoError(t, l.Run(context.Background(), gitCommitSignal()))
+	assert.Equal(t, loop.StatusSuggested, lastStatus(t, db, ws))
+}
+
+func TestRun_NoChangeSkipsVerificationAndRemovesBranch(t *testing.T) {
+	repo := initRepo(t)
+	cfg := bugFixCfg()
+	cfg.Verification.Commands = []config.VerificationCommand{{Name: "must-not-run", Run: "exit 9"}}
+	l, db, ws := newLoop(t, repo, &scriptedProvider{noChange: true}, cfg)
+
+	require.NoError(t, l.Run(context.Background(), gitCommitSignal()))
+	assert.Equal(t, loop.StatusCompleted, lastStatus(t, db, ws))
+	out, cmdErr := exec.Command("git", "-C", repo, "branch", "--list", "sidecar/*").Output()
+	require.NoError(t, cmdErr)
+	assert.Empty(t, strings.TrimSpace(string(out)))
 }
 
 func TestRun_BudgetExceededSkips(t *testing.T) {

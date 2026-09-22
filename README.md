@@ -17,6 +17,8 @@ Signal source (git / CI / schedule / logs / metrics / uptime)
         ↓
    Coding agent (Claude — read, edit, bash, run tests; skills loaded)
         ↓
+  Deterministic verification (configured commands; fail closed)
+        ↓
   Evaluator (fresh skeptic — runs tests on the diff, PASS or REJECT)
         ↓
   Output routing (auto-commit / pull-request / suggest-only / notify)
@@ -74,13 +76,26 @@ The coding agent is a multi-turn Claude Sonnet session with access to four tools
 | `edit_file` | — | — | ✓ |
 
 The system prompt is signal-specific (different instructions for a git commit vs a log anomaly vs a scheduled sweep) and includes:
-- The workspace root path so the agent uses absolute file paths from the first turn
+- The exact resolved workspace root path
 - Retrieved memory context
-- An instruction to start exploration with `find <workspace> -name "*.go" | head -40` (or equivalent) rather than guessing filenames
+- Instructions to run `pwd`, use relative paths, and never guess another repository location
+- Any configured deterministic verification commands
 
 The agent runs up to 20 turns inside an **isolated git worktree** dedicated to this task, so concurrent signals never share a working tree. If a `.sidecar/skills/` directory exists in the target repo, its `SKILL.md` files are loaded as **skills** — persistent project knowledge the agent can pull in on demand instead of re-deriving it every run. Typical task flow: discover the repo layout → read relevant files → run the test suite → identify the failure → apply a targeted fix → run tests again to confirm.
 
-### 5. Evaluator gate
+### 5. Deterministic verification and evaluator gate
+
+For code-shipping tasks, Sidecar can run deployment-defined verification
+commands after the coding agent finishes and before the evaluator or output
+routing. Commands run sequentially through `/bin/sh -c`, stop on the first
+failure, have bounded output and timeouts, and receive only explicitly allowed
+environment variables. A failed command marks the task failed and discards the
+temporary worktree and branch.
+
+Sidecar does not install project dependencies. The repair image or host must
+provide every runtime, package manager, dependency, and executable declared in
+`required_tools`. Run Sidecar as an unprivileged OS user; verification uses the
+current user and never elevates privileges.
 
 Before any code ships (`auto-commit` or `pull-request`), an **adversarial evaluator** reviews the diff. It is a fresh agent session — different context from the coding agent, instructed to assume the change is broken until proven otherwise — with read and bash tools only. It runs the build and tests against the diff (anchored to the worktree's base ref, so it sees the change even if the coding agent committed it itself) and returns a verdict:
 
@@ -88,7 +103,7 @@ Before any code ships (`auto-commit` or `pull-request`), an **adversarial evalua
 {"pass": false, "reasons": "tests still fail: TestCreate expects 201, got 200"}
 ```
 
-On **REJECT**, the change does not ship — it is recorded as a suggestion with the evaluator's reasons. The gate **fails closed**: if the evaluator errors or returns unparseable output, the change is treated as rejected, never silently committed. The evaluator is enabled by default (`verification.enabled: true`) and applies to both `auto-commit` and `pull-request`. `suggest-only` and `notify` skip it.
+On **REJECT**, the change does not ship — it is recorded as a suggestion with the evaluator's reasons. The gate **fails closed**: if the evaluator errors or returns unparseable output, the change is treated as rejected, never silently committed. Verification is enabled by default (`verification.enabled: true`) and applies to both `auto-commit` and `pull-request`. Setting it to `false` disables both configured commands and the evaluator. `suggest-only`, `notify`, and unchanged tasks skip commands.
 
 ### 6. Output routing
 
@@ -512,6 +527,13 @@ autonomy:
 # suggestion). Fails closed. Default on.
 verification:
   enabled: true
+  commands:
+    - name: backend-tests
+      run: go test ./...
+      required_tools: [go]
+      timeout: 10m          # default 10m; maximum 30m
+      working_directory: . # relative to the task worktree
+      pass_env: [PATH, HOME]
 
 # Daily token budget. Sums provider-reported usage (input+output+cache)
 # across triage + coding + evaluator, per workspace per UTC day; checked
