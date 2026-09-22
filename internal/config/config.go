@@ -113,8 +113,11 @@ func (n NotificationConfig) ResolveURL() string {
 }
 
 type EmbeddingConfig struct {
-	Provider string `yaml:"provider"` // "openai" | "voyage"; empty = disabled
-	Model    string `yaml:"model"`    // optional; uses provider default if empty
+	Provider   string `yaml:"provider"`    // "openai" | "voyage" | "cohere"
+	Model      string `yaml:"model"`       // provider model, optional
+	BaseURL    string `yaml:"base_url"`    // optional compatible gateway endpoint
+	APIKeyEnv  string `yaml:"api_key_env"` // env var containing provider credential
+	Dimensions int    `yaml:"dimensions"`  // default 1024
 }
 
 type LogsSignalConfig struct {

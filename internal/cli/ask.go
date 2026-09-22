@@ -6,12 +6,12 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/spf13/cobra"
 	"github.com/sausheong/harness/providers/anthropic"
 	"github.com/sausheong/sidecar/internal/config"
 	"github.com/sausheong/sidecar/internal/loop"
 	"github.com/sausheong/sidecar/internal/memory"
 	"github.com/sausheong/sidecar/internal/store"
+	"github.com/spf13/cobra"
 )
 
 func askCmd() *cobra.Command {
@@ -64,7 +64,7 @@ func askCmd() *cobra.Command {
 			}
 
 			models := loop.ResolveModels(cfg)
-			llmProvider := anthropic.NewAnthropicProvider(os.Getenv("ANTHROPIC_API_KEY"), "")
+			llmProvider := anthropic.NewAnthropicProvider(os.Getenv("ANTHROPIC_API_KEY"), os.Getenv("ANTHROPIC_BASE_URL"))
 
 			answer, err := memory.Ask(ctx, embeddingProvider, llmProvider, models.Triage, db, ws, question)
 			if err != nil {

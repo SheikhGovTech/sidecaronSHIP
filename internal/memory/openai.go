@@ -17,6 +17,7 @@ type OpenAIProvider struct {
 	apiKey  string
 	model   string
 	baseURL string
+	dims    int
 	client  *http.Client
 }
 
@@ -27,26 +28,39 @@ func NewOpenAI(apiKey, model string) *OpenAIProvider {
 
 // NewOpenAIWithBaseURL creates a provider with a custom base URL (used in tests).
 func NewOpenAIWithBaseURL(apiKey, model, baseURL string) *OpenAIProvider {
+	return NewOpenAIWithBaseURLAndDimensions(apiKey, model, baseURL, 1024)
+}
+
+// NewOpenAIWithBaseURLAndDimensions creates an OpenAI-compatible provider with
+// an explicit output dimension.
+func NewOpenAIWithBaseURLAndDimensions(apiKey, model, baseURL string, dimensions int) *OpenAIProvider {
 	if model == "" {
 		model = openAIDefaultModel
+	}
+	if dimensions <= 0 {
+		dimensions = 1024
 	}
 	return &OpenAIProvider{
 		apiKey:  apiKey,
 		model:   model,
 		baseURL: baseURL,
+		dims:    dimensions,
 		client:  &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
 // Dims returns 1024 (reduced via dimensions param to match schema).
-func (p *OpenAIProvider) Dims() int { return 1024 }
+func (p *OpenAIProvider) Dims() int { return p.dims }
 
 // Embed calls the OpenAI embeddings API. inputType is ignored (OpenAI has no query/document distinction).
-func (p *OpenAIProvider) Embed(ctx context.Context, texts []string, _ string) ([][]float32, error) {
+func (p *OpenAIProvider) Embed(ctx context.Context, texts []string, inputType string) ([][]float32, error) {
 	payload := map[string]any{
 		"input":      texts,
 		"model":      p.model,
-		"dimensions": 1024, // reduce from 1536 to match schema
+		"dimensions": p.dims,
+	}
+	if inputType != "" {
+		payload["input_type"] = inputType
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -84,6 +98,11 @@ func (p *OpenAIProvider) Embed(ctx context.Context, texts []string, _ string) ([
 	for _, d := range result.Data {
 		if d.Index < len(embeddings) {
 			embeddings[d.Index] = d.Embedding
+		}
+	}
+	for i, embedding := range embeddings {
+		if len(embedding) != p.dims {
+			return nil, fmt.Errorf("embedding %d has dimension %d, expected %d", i, len(embedding), p.dims)
 		}
 	}
 	return embeddings, nil
