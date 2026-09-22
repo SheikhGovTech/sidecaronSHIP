@@ -29,6 +29,8 @@
 - [x] Set failed task status, notify failure, skip evaluator/output, and clean
       worktree/local commits/temporary branch after failed verification.
 - [x] Preserve existing behavior when the command list is empty.
+- [x] Raise the evaluator's bounded turn allowance from 8 to 20 so complex
+      assessments can complete before output routing.
 
 ## Security and resilience
 

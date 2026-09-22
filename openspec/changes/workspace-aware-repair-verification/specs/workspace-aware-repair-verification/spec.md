@@ -129,6 +129,19 @@ task state.
 - **AND** worktree changes and local commits are discarded
 - **AND** the temporary task branch is deleted where safe
 
+### Requirement: Evaluator completion allowance
+
+The adversarial evaluator SHALL be allowed up to 20 turns to assess a verified
+repair before it is considered to have exceeded its turn limit.
+
+#### Scenario: Evaluation requires more than eight turns
+
+- **WHEN** assessment of a verified code-shipping repair requires more than
+  eight evaluator turns
+- **THEN** evaluation may continue up to the 20-turn limit
+- **AND** Sidecar does not downgrade the repair to suggestion-only merely
+  because the former eight-turn limit was reached
+
 ### Requirement: Deployment responsibility
 
 Sidecar SHALL remain language-agnostic. Deployments SHALL provide required

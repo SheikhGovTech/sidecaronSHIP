@@ -63,6 +63,15 @@ task becomes `failed`, failure notification fires, evaluator/output routing is
 skipped, the worktree is cleaned up, agent-created local commits are discarded
 with it, and the temporary task branch is deleted where safe.
 
+## Evaluator turn allowance
+
+The evaluator runtime uses a 20-turn allowance instead of eight. Eight turns
+proved insufficient for an observed repair assessment: the evaluator exhausted
+its allowance, and Sidecar downgraded the merge-request fix to a suggestion
+without delivering a branch or GitLab merge request. Twenty turns gives the
+evaluator room to inspect the repair and verification evidence while retaining
+a finite upper bound on model work.
+
 ## Security
 
 - Reject absolute and escaping working directories.
