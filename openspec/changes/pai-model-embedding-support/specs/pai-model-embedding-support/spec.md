@@ -57,9 +57,9 @@ The embedding layer SHALL support Cohere models and send the configured
 #### Scenario: Cohere query and document input types
 
 - **WHEN** Sidecar embeds a search query
-- **THEN** the provider sends `input_type: "search_query"`
+- **THEN** the provider maps `query` to `input_type: "search_query"`
 - **WHEN** Sidecar stores memory content
-- **THEN** the provider sends `input_type: "search_document"`
+- **THEN** the provider maps `document` to `input_type: "search_document"`
 
 ### Requirement: Configuration documentation and tests
 

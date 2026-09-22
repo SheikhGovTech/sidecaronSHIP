@@ -27,10 +27,10 @@ dimensions. The configured base URL may include a gateway prefix such as
 `/platform/models`, resulting in a request to
 `/platform/models/v1/embeddings`.
 
-Add a Cohere implementation that sends `input_type` as `search_query` or
-`search_document` according to the Sidecar embedding call site. Provider
-authentication and non-success responses must return actionable errors while
-leaving existing memory failure handling intact.
+Add a Cohere implementation that maps Sidecar's internal input types to the
+provider contract: `query` becomes `search_query`, and `document` becomes
+`search_document`. Provider authentication and non-success responses must
+return actionable errors while leaving existing memory failure handling intact.
 
 The default Cohere target is `cohere.embed-english-v3` with 1024 dimensions so
 it remains compatible with the existing `vector(1024)` database column. The
