@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -469,17 +470,33 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 			l.discardWorktree(task.ID.String(), wt, &wtCleanup)
 			return nil
 		}
-		repo, token := l.resolveRepoAndToken(sig)
-		if repo != "" {
-			pc := output.NewPRCreator(l.repoPath, repo, token)
-			prURL, prErr := pc.Create(branch, "sidecar: "+task.Summary, l.prBody(sig, tr, task.ID.String()))
-			if prErr != nil {
-				slog.Warn("sidecar PR creation failed", "err", prErr, "branch", branch)
-			} else {
-				_ = l.db.AppendTaskEvent(ctx, task.ID, "pr_created", map[string]any{"url": prURL})
-				slog.Info("sidecar PR created", "url", prURL, "task", task.ID)
-			}
+		fallbackRepo, fallbackToken := l.resolveRepoAndToken(sig)
+		target, resolveErr := output.ResolveDelivery(l.cfg.Delivery, l.repoPath, sig.Source, fallbackRepo, fallbackToken)
+		if resolveErr != nil {
+			return l.failDelivery(ctx, sig, task, branch, output.DeliveryTarget{Provider: l.cfg.Delivery.Provider}, output.PublishResult{}, resolveErr)
 		}
+		result, publishErr := output.NewPublisher(target).Publish(ctx, output.PublishRequest{
+			RepoPath: l.repoPath,
+			Branch:   branch,
+			Title:    "sidecar: " + task.Summary,
+			Body:     l.prBody(sig, tr, task.ID.String()),
+		})
+		if result.Pushed {
+			_ = l.db.AppendTaskEvent(ctx, task.ID, "branch_pushed", map[string]any{
+				"provider": target.Provider, "remote": target.Remote, "repo": target.Repo, "branch": branch,
+			})
+		}
+		if publishErr != nil {
+			return l.failDelivery(ctx, sig, task, branch, target, result, publishErr)
+		}
+		eventType := "change_request_created"
+		if result.Reused {
+			eventType = "change_request_reused"
+		}
+		_ = l.db.AppendTaskEvent(ctx, task.ID, eventType, map[string]any{
+			"provider": target.Provider, "url": result.URL, "branch": branch, "base_branch": target.BaseBranch,
+		})
+		slog.Info("sidecar change request ready", "provider", target.Provider, "url", result.URL, "task", task.ID)
 		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusCompleted)
 		l.dispatcher.Fire(ctx, notify.EventCompleted, sig, task)
 		return nil
@@ -500,6 +517,24 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		l.dispatcher.Fire(ctx, notify.EventCompleted, sig, task)
 		return nil
 	}
+}
+
+func (l *Loop) failDelivery(ctx context.Context, sig adapter.Signal, task *store.Task, branch string, target output.DeliveryTarget, result output.PublishResult, deliveryErr error) error {
+	phase := "resolve"
+	var typed *output.DeliveryError
+	if errors.As(deliveryErr, &typed) {
+		phase = typed.Phase
+	}
+	errText := deliveryErr.Error()
+	if target.Token != "" {
+		errText = strings.ReplaceAll(errText, target.Token, "[REDACTED]")
+	}
+	_ = l.db.AppendTaskEvent(ctx, task.ID, "delivery_failed", map[string]any{
+		"provider": target.Provider, "phase": phase, "branch": branch, "branch_pushed": result.Pushed, "error": errText,
+	})
+	_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
+	l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
+	return deliveryErr
 }
 
 func workspaceHasChanges(workDir, baseRef string) (bool, error) {
