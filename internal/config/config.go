@@ -2,8 +2,10 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,6 +23,58 @@ type Config struct {
 	Verification  VerificationConfig   `yaml:"verification"`
 	Skills        SkillsConfig         `yaml:"skills"`
 	Budget        BudgetConfig         `yaml:"budget"`
+	Delivery      DeliveryConfig       `yaml:"delivery"`
+}
+
+// DeliveryConfig controls where approved pull-request changes are published.
+// Empty fields are resolved from the configured Git remote when unambiguous.
+type DeliveryConfig struct {
+	Provider   string `yaml:"provider"`
+	Repo       string `yaml:"repo"`
+	Remote     string `yaml:"remote"`
+	APIBaseURL string `yaml:"api_base_url"`
+	Token      string `yaml:"token"`
+	BaseBranch string `yaml:"base_branch"`
+}
+
+func (d DeliveryConfig) ResolveToken() string {
+	if strings.HasPrefix(d.Token, "$") {
+		return os.Getenv(strings.TrimPrefix(d.Token, "$"))
+	}
+	return d.Token
+}
+
+func (d DeliveryConfig) Validate() error {
+	if d.Provider != "" && d.Provider != "github" && d.Provider != "gitlab" {
+		return fmt.Errorf("delivery provider must be github or gitlab")
+	}
+	for field, value := range map[string]string{"repo": d.Repo, "remote": d.Remote, "base_branch": d.BaseBranch} {
+		if strings.ContainsAny(value, "\r\n") {
+			return fmt.Errorf("delivery %s contains a newline", field)
+		}
+	}
+	if d.Repo != "" && !regexp.MustCompile(`^[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+$`).MatchString(d.Repo) {
+		return fmt.Errorf("delivery repo must be an owner/repository slug")
+	}
+	if d.Provider == "github" && d.Repo != "" && strings.Count(d.Repo, "/") != 1 {
+		return fmt.Errorf("GitHub delivery repo must be owner/repository")
+	}
+	if d.Remote != "" && (!regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]*$`).MatchString(d.Remote) || strings.Contains(d.Remote, "..")) {
+		return fmt.Errorf("delivery remote is invalid")
+	}
+	if d.BaseBranch != "" && (strings.HasPrefix(d.BaseBranch, "-") || strings.ContainsAny(d.BaseBranch, " \t~^:?*[\\") || strings.Contains(d.BaseBranch, "..")) {
+		return fmt.Errorf("delivery base_branch is invalid")
+	}
+	if d.Token == "$" {
+		return fmt.Errorf("delivery token environment reference is empty")
+	}
+	if d.APIBaseURL != "" {
+		u, err := url.Parse(d.APIBaseURL)
+		if err != nil || u.Scheme != "https" || u.Host == "" {
+			return fmt.Errorf("delivery api_base_url must be an absolute HTTPS URL")
+		}
+	}
+	return nil
 }
 
 // VerificationConfig controls deterministic commands and the adversarial
@@ -337,6 +391,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config %q: %w", path, err)
 	}
 	if err := cfg.ValidateVerification(); err != nil {
+		return nil, fmt.Errorf("validating config %q: %w", path, err)
+	}
+	if err := cfg.Delivery.Validate(); err != nil {
 		return nil, fmt.Errorf("validating config %q: %w", path, err)
 	}
 	return &cfg, nil

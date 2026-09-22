@@ -218,3 +218,33 @@ func TestDailyTokenBudget_RespectsConfigured(t *testing.T) {
 	cfg := &config.Config{Budget: config.BudgetConfig{DailyTokens: 500000}}
 	assert.Equal(t, 500000, cfg.DailyTokenBudget())
 }
+
+func TestLoadDelivery(t *testing.T) {
+	t.Setenv("DELIVERY_TEST_TOKEN", "secret")
+	yaml := `
+delivery:
+  provider: gitlab
+  repo: group/project
+  remote: origin
+  api_base_url: https://gitlab.example.gov/api/v4
+  token: $DELIVERY_TEST_TOKEN
+  base_branch: main
+`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sidecar.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o644))
+	cfg, err := config.Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "gitlab", cfg.Delivery.Provider)
+	assert.Equal(t, "secret", cfg.Delivery.ResolveToken())
+}
+
+func TestDeliveryValidation(t *testing.T) {
+	assert.Error(t, (config.DeliveryConfig{Provider: "bitbucket"}).Validate())
+	assert.Error(t, (config.DeliveryConfig{APIBaseURL: "http://insecure.example"}).Validate())
+	assert.Error(t, (config.DeliveryConfig{Remote: "origin\nmalicious"}).Validate())
+	assert.Error(t, (config.DeliveryConfig{Repo: "missing-owner"}).Validate())
+	assert.Error(t, (config.DeliveryConfig{Remote: "-bad"}).Validate())
+	assert.Error(t, (config.DeliveryConfig{BaseBranch: "../main"}).Validate())
+	assert.NoError(t, (config.DeliveryConfig{Provider: "github", APIBaseURL: "https://github.example/api/v3"}).Validate())
+}

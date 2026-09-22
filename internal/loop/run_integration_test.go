@@ -302,6 +302,20 @@ func TestRun_NoChangeSkipsVerificationAndRemovesBranch(t *testing.T) {
 	assert.Empty(t, strings.TrimSpace(string(out)))
 }
 
+func TestRun_DeliveryFailureCannotComplete(t *testing.T) {
+	repo := initRepo(t)
+	out, err := exec.Command("git", "-C", repo, "remote", "add", "origin", "/definitely/missing/sidecar-remote.git").CombinedOutput()
+	require.NoError(t, err, string(out))
+	cfg := bugFixCfg()
+	cfg.Autonomy.BugFixes = "pull-request"
+	cfg.Delivery = config.DeliveryConfig{Provider: "gitlab", Repo: "group/project", Remote: "origin", BaseBranch: "main"}
+	l, db, ws := newLoop(t, repo, &scriptedProvider{evalPass: true}, cfg)
+
+	err = l.Run(context.Background(), gitCommitSignal())
+	assert.Error(t, err)
+	assert.Equal(t, loop.StatusFailed, lastStatus(t, db, ws))
+}
+
 func TestRun_BudgetExceededSkips(t *testing.T) {
 	repo := initRepo(t)
 	cfg := bugFixCfg()

@@ -84,7 +84,7 @@ func (p *PRCreator) pushBranch(branch string) error {
 	}
 
 	// Production: use GIT_ASKPASS to avoid embedding the token in the process command line.
-	askpass, err := writeTempAskpass(p.token)
+	askpass, err := writeEnvironmentAskpass()
 	if err != nil {
 		return fmt.Errorf("creating askpass: %w", err)
 	}
@@ -95,33 +95,13 @@ func (p *PRCreator) pushBranch(branch string) error {
 	cmd.Env = append(os.Environ(),
 		"GIT_ASKPASS="+askpass,
 		"GIT_TERMINAL_PROMPT=0",
+		"SIDECAR_GIT_USERNAME=x-access-token",
+		"SIDECAR_GIT_TOKEN="+p.token,
 	)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git push: %w\n%s", err, out)
 	}
 	return nil
-}
-
-// writeTempAskpass writes a temporary executable script that echoes the token
-// when git asks for a password. Returns the script path.
-func writeTempAskpass(token string) (string, error) {
-	f, err := os.CreateTemp("", "sidecar-askpass-*.sh")
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	// The script echoes the token regardless of which credential field git asks for.
-	script := fmt.Sprintf("#!/bin/sh\necho '%s'\n", token)
-	if _, err := f.WriteString(script); err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-	if err := os.Chmod(f.Name(), 0700); err != nil {
-		os.Remove(f.Name())
-		return "", err
-	}
-	return f.Name(), nil
 }
 
 func (p *PRCreator) createViaGH(branch, base, title, body string) (string, error) {

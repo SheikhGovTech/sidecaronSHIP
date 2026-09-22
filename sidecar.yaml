@@ -34,6 +34,16 @@ verification:
   #     working_directory: .
   #     pass_env: [PATH, HOME]
 
+# Provider-aware pull-request delivery. Configure this on repositories using
+# pull-request autonomy; GitLab creates an MR and GitHub creates a PR.
+# delivery:
+#   provider: gitlab
+#   repo: group/project
+#   remote: origin
+#   api_base_url: https://gitlab.example.gov/api/v4
+#   token: $GITLAB_TOKEN
+#   base_branch: main
+
 models:
   planning: anthropic/claude-sonnet-4-6
   coding: anthropic/claude-sonnet-4-6

@@ -404,7 +404,7 @@ Sidecar runs migrations automatically on `attach`.
 | `VOYAGE_API_KEY` | When `embedding.provider: voyage` | Voyage AI embeddings |
 | `COHERE_API_KEY` | When `embedding.provider: cohere` | Cohere embeddings |
 | `GITHUB_TOKEN` | For GitHub CI adapter / PR creation | GitHub personal access token |
-| `GITLAB_TOKEN` | For GitLab CI adapter | GitLab personal access token |
+| `GITLAB_TOKEN` | For GitLab CI adapter / MR creation | GitLab personal access token |
 | `CIRCLECI_TOKEN` | For CircleCI adapter | CircleCI API token |
 | `DATADOG_API_KEY` | For Datadog metrics adapter | Datadog API key |
 | `DATADOG_APP_KEY` | For Datadog metrics adapter | Datadog application key |
@@ -514,6 +514,16 @@ signals:
           expect_status: 200
           expect_max_ms: 500    # fire if response takes >500ms
 
+# Where approved pull-request changes are delivered. This belongs to the
+# attached repository and is independent of the signal source.
+delivery:
+  provider: gitlab
+  repo: "group/project"
+  remote: origin
+  api_base_url: "https://gitlab.example.gov/api/v4"
+  token: $GITLAB_TOKEN
+  base_branch: main
+
 # How much autonomy Sidecar has per change type.
 # Levels: auto-commit | pull-request | suggest-only | notify
 autonomy:
@@ -538,6 +548,19 @@ verification:
       timeout: 10m          # default 10m; maximum 30m
       working_directory: . # relative to the task worktree
       pass_env: [PATH, HOME]
+
+# GitHub repositories use the same delivery contract:
+# delivery:
+#   provider: github
+#   repo: owner/repository
+#   remote: origin
+#   api_base_url: https://api.github.com
+#   token: $GITHUB_TOKEN
+#   base_branch: main
+
+# For GitHub Enterprise or self-managed GitLab, set api_base_url to that
+# installation's API root. Branches are pushed through `remote`, so existing
+# SSH remotes and credential helpers continue to work.
 
 # Daily token budget. Sums provider-reported usage (input+output+cache)
 # across triage + coding + evaluator, per workspace per UTC day; checked
