@@ -11,6 +11,11 @@ Sidecar also asks agents and evaluators to run tests without a deterministic,
 configurable verification command. This is unreliable in persistent container
 deployments where project dependencies and tools may not be installed.
 
+The adversarial evaluator is currently limited to eight turns. In an observed
+repair, it exhausted that allowance before completing its assessment. Sidecar
+then downgraded the merge-request fix to a suggestion, so no branch or GitLab
+merge request was delivered despite the coding agent having produced a repair.
+
 ## Intended outcome
 
 For every actionable task, Sidecar SHALL:
@@ -20,6 +25,8 @@ For every actionable task, Sidecar SHALL:
 - Instruct agents to use relative paths and not guess repository locations.
 - Run configured verification commands from the correct worktree directories.
 - Fail closed before commit or merge-request output when verification fails.
+- Allow the evaluator up to 20 turns to complete its assessment before treating
+  it as exhausted.
 - Continue to evaluation and output routing only after successful verification.
 
 Sidecar remains language-agnostic. Deployments remain responsible for language

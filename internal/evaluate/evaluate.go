@@ -168,7 +168,7 @@ func EvaluateWithCommands(ctx context.Context, provider llm.LLMProvider, model, 
 			Model:        model,
 			Workspace:    workDir,
 			SystemPrompt: SystemPromptWithContext(workDir, commands),
-			MaxTurns:     8,
+			MaxTurns:     20,
 		},
 	)
 	if err != nil {
