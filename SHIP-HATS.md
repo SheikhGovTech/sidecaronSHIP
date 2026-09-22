@@ -21,7 +21,10 @@ The upstream Sidecar CI adapters emit bare pipeline status with no error context
 1. `GET /pipelines/:id/jobs` → find failed job name
 2. `GET /jobs/:id/trace` → smart error extraction (pattern match + context window + tail summary)
 3. `GET /commits/:sha/diff` → commit diff + changed file list
-4. `GET /pipelines?ref=main` → pipeline history for flake detection
+4. `GET /pipelines?ref=main` → pipeline history for strict pass/fail alternation detection
+
+Changed files are always retained. The full diff is included only when it is
+32 KiB or smaller, preventing oversized agent prompts without losing file scope.
 
 ### Smart error extraction
 

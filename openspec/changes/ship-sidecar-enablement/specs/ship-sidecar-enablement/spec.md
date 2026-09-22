@@ -20,8 +20,9 @@ when unset. GitLab CI error patterns SHALL be configurable through
 
 GitLab CI failure signals SHALL best-effort include the failed job, smart error
 log context, changed files, commit diff, and flake status. Logs SHALL be
-bounded to 150 lines and diffs SHALL be bounded to 64 KiB. Missing API data
-SHALL degrade to empty optional fields.
+bounded to 150 lines. Commit diffs SHALL be included only when they are at
+most 32 KiB; larger diffs SHALL fall back to the complete changed-file list.
+Missing API data SHALL degrade to empty optional fields.
 
 Triage SHALL receive failed-job, log, changed-file, and flake context. The
 coding agent SHALL receive job logs and the commit diff or changed-file list,
