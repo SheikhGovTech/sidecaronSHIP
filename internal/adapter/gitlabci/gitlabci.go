@@ -15,7 +15,13 @@ import (
 	"github.com/sausheong/sidecar/internal/adapter"
 )
 
-const defaultBaseURL = "https://sgts.gitlab-dedicated.com"
+const (
+	defaultBaseURL       = "https://sgts.gitlab-dedicated.com"
+	maxExtractedLogLines = 150
+	tailLogLines         = 30
+	fallbackLogLines     = 100
+	maxCommitDiffBytes   = 32 * 1024
+)
 
 var defaultErrorPatterns = []string{
 	"Error:", "ERROR:", "error:",
@@ -256,45 +262,64 @@ func (a *GitLabCIAdapter) fetchJobTrace(ctx context.Context, encodedProject stri
 
 func (a *GitLabCIAdapter) extractErrorContext(trace string) string {
 	lines := strings.Split(trace, "\n")
-	if len(lines) <= 100 {
+	if len(lines) <= fallbackLogLines {
 		return trace
 	}
 
-	var errorLines []string
-	seen := make(map[string]bool)
+	selected := make([]bool, len(lines))
+	var contextIndices []int
 
 	for i, line := range lines {
 		if a.matchesErrorPattern(line) {
-			for _, cl := range extractWindow(lines, i, 2) {
-				if !seen[cl] {
-					seen[cl] = true
-					errorLines = append(errorLines, cl)
+			start := i - 2
+			if start < 0 {
+				start = 0
+			}
+			end := i + 2
+			if end >= len(lines) {
+				end = len(lines) - 1
+			}
+			for j := start; j <= end; j++ {
+				if !selected[j] {
+					selected[j] = true
+					contextIndices = append(contextIndices, j)
 				}
 			}
 		}
 	}
 
-	tailStart := len(lines) - 30
-	if tailStart < 0 {
-		tailStart = 0
-	}
-	for _, line := range lines[tailStart:] {
-		if !seen[line] {
-			seen[line] = true
-			errorLines = append(errorLines, line)
-		}
-	}
-
-	if len(errorLines) == 0 {
-		start := len(lines) - 100
-		if start < 0 {
-			start = 0
-		}
+	if len(contextIndices) == 0 {
+		start := len(lines) - fallbackLogLines
 		return strings.Join(lines[start:], "\n")
 	}
 
-	if len(errorLines) > 150 {
-		errorLines = errorLines[:150]
+	// Reserve space for the tail before applying the total line cap. Tracking
+	// line positions (rather than text values) preserves repeated log lines.
+	tailStart := len(lines) - tailLogLines
+	if tailStart < 0 {
+		tailStart = 0
+	}
+	keep := make([]bool, len(lines))
+	kept := 0
+	for i := tailStart; i < len(lines); i++ {
+		keep[i] = true
+		kept++
+	}
+	for _, i := range contextIndices {
+		if kept >= maxExtractedLogLines {
+			break
+		}
+		if !keep[i] {
+			keep[i] = true
+			kept++
+		}
+	}
+
+	errorLines := make([]string, 0, kept)
+	for i, line := range lines {
+		if keep[i] {
+			errorLines = append(errorLines, line)
+		}
 	}
 	return strings.Join(errorLines, "\n")
 }
@@ -308,53 +333,67 @@ func (a *GitLabCIAdapter) matchesErrorPattern(line string) bool {
 	return false
 }
 
-func extractWindow(lines []string, center, radius int) []string {
-	start := center - radius
-	if start < 0 {
-		start = 0
-	}
-	end := center + radius + 1
-	if end > len(lines) {
-		end = len(lines)
-	}
-	return lines[start:end]
-}
-
 // ── Fetch commit diff ───────────────────────────────────────────────────
 
 func (a *GitLabCIAdapter) fetchCommitDiff(ctx context.Context, sha string) (string, string) {
 	encoded := url.PathEscape(a.repo)
-	diffURL := fmt.Sprintf("%s/api/v4/projects/%s/repository/commits/%s/diff",
+	diffURL := fmt.Sprintf("%s/api/v4/projects/%s/repository/commits/%s/diff?per_page=100",
 		a.baseURL, encoded, sha)
 
-	data, err := a.getJSON(ctx, diffURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, diffURL, nil)
 	if err != nil {
 		return "", ""
 	}
-
-	var diffs []gitlabDiffEntry
-	if err := json.Unmarshal(data, &diffs); err != nil {
+	if a.token != "" {
+		req.Header.Set("PRIVATE-TOKEN", a.token)
+	}
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return "", ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
 		return "", ""
 	}
 
 	var files []string
 	var fullDiff strings.Builder
-	for _, d := range diffs {
+	diffTooLarge := false
+	dec := json.NewDecoder(resp.Body)
+	token, err := dec.Token()
+	if err != nil || token != json.Delim('[') {
+		return "", ""
+	}
+	for dec.More() {
+		var d gitlabDiffEntry
+		if err := dec.Decode(&d); err != nil {
+			return "", ""
+		}
 		path := d.NewPath
 		if path == "" {
 			path = d.OldPath
 		}
 		files = append(files, path)
-		fullDiff.WriteString(fmt.Sprintf("--- a/%s\n+++ b/%s\n%s\n", d.OldPath, d.NewPath, d.Diff))
+
+		if !diffTooLarge {
+			entry := fmt.Sprintf("--- a/%s\n+++ b/%s\n%s\n", d.OldPath, d.NewPath, d.Diff)
+			if fullDiff.Len()+len(entry) > maxCommitDiffBytes {
+				diffTooLarge = true
+				fullDiff.Reset()
+			} else {
+				fullDiff.WriteString(entry)
+			}
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return "", ""
 	}
 
 	changedFiles := strings.Join(files, ", ")
-	diffStr := fullDiff.String()
-
-	if len(diffStr) > 32*1024 {
+	if diffTooLarge {
 		return changedFiles, ""
 	}
-	return changedFiles, diffStr
+	return changedFiles, fullDiff.String()
 }
 
 // ── Flake detection ─────────────────────────────────────────────────────
@@ -391,16 +430,12 @@ func (a *GitLabCIAdapter) detectFlake(ctx context.Context, ref string, currentPi
 		return false
 	}
 
-	failures := 0
-	successes := 0
-	for _, s := range statuses {
-		if s == "failed" {
-			failures++
-		} else {
-			successes++
+	for i := 1; i < len(statuses); i++ {
+		if statuses[i] == statuses[i-1] {
+			return false
 		}
 	}
-	return failures >= 1 && successes >= 1
+	return true
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
