@@ -15,7 +15,7 @@ coding agent completes
   -> record approved paths and staged-diff digest
   -> run deterministic verification
   -> evaluate the staged diff
-  -> commit the existing index without restaging
+  -> commit the existing index without restaging, using deployment Git policy
   -> verify base..HEAD against the approved snapshot
   -> sign, push, and create the change request
 ```
@@ -29,8 +29,9 @@ prepares and evaluates a new snapshot.
 The agent may invoke Git through Bash. Before staging, Sidecar runs the
 equivalent of `git reset --mixed <task-base>` within the isolated worktree.
 This preserves file changes while removing agent-created commits from the
-delivery history. Sidecar then owns filtering, final commit metadata, and
-signing.
+delivery history. Sidecar then owns filtering and the commit-content boundary.
+The attached repository or deployment runtime owns final commit identity and
+signing through its normal Git configuration.
 
 Normalization fails closed if the task base is missing, is not an ancestor of
 the prepared worktree state, or cannot be resolved safely. Sidecar never
@@ -83,7 +84,10 @@ working tree while the staged snapshot remains authoritative.
 ## Commit and publication integrity
 
 After approval, Sidecar invokes `git commit` against the existing index. It
-does not run `git add`, `git add -A`, or an equivalent restaging operation.
+does not run `git add`, `git add -A`, an equivalent restaging operation, or
+command-level Git configuration that overrides identity or signing. The
+deployment's Git configuration determines the committer identity and whether
+the commit is signed.
 Before any push, Sidecar recomputes the canonical patch and path manifest from
 `<task-base>..HEAD` and compares both with the approved snapshot.
 

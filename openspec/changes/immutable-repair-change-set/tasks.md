@@ -35,8 +35,9 @@
 
 - [x] Remove final `git add -A` and equivalent restaging from evaluation and
       commit handling.
-- [x] Commit only the already-prepared index with Sidecar-controlled metadata
-      and signing.
+- [x] Commit only the already-prepared index while preserving the attached
+      repository or deployment runtime's configured Git identity and signing
+      policy.
 - [x] Recompute the manifest and canonical digest from `task-base..HEAD` before
       push.
 - [x] Fail the task, notify failure, and skip publication when the committed
@@ -65,7 +66,8 @@
 - [x] Test verification and evaluator artifacts remain outside the commit.
 - [x] Test evaluator inspection uses the staged diff.
 - [x] Test index mutation after approval fails closed.
-- [x] Test agent self-commit cannot bypass Sidecar filtering or signing.
+- [x] Test agent self-commit cannot bypass Sidecar filtering and that the final
+      commit preserves the configured identity and signing policy.
 - [x] Test pre-push manifest and digest mismatch blocks publication and emits a
       failed notification.
 - [x] Test the matching approved commit proceeds to provider-aware delivery.

@@ -27,7 +27,10 @@ that the committed paths and diff match the approved manifest and digest before
 pushing or creating a change request.
 
 This gives Sidecar a hard guarantee that runtime artifacts cannot enter a
-repair unnoticed and that the evaluated repair is the repair delivered.
+repair unnoticed and that the evaluated repair is the repair delivered. Git
+identity and signing remain deployment policy: Sidecar uses the Git
+configuration supplied by the attached repository or runtime rather than
+hardcoding a provider-specific identity or disabling signing.
 
 ## Scope
 

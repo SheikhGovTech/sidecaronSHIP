@@ -97,8 +97,8 @@ prepared index and SHALL NOT run `git add -A` or any equivalent restaging step.
 #### Scenario: Approved repair is committed
 
 - **WHEN** deterministic verification and evaluation permit publication
-- **THEN** Sidecar commits the existing index using Sidecar-controlled metadata
-  and signing configuration
+- **THEN** Sidecar commits the existing index using the attached repository or
+  deployment runtime's configured Git identity and signing policy
 - **AND** no later worktree artifacts are included
 
 #### Scenario: Index changes after approval
