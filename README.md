@@ -6,17 +6,20 @@ An autonomous engineering agent that attaches to any software project as a persi
 
 ## Upstream Contribution Status
 
-The capabilities developed in this fork have been submitted to the parent
-project as three independently reviewable pull requests:
+This fork is the reference implementation for SHIP-HATS deployments while the
+following reusable capabilities are reviewed upstream.
 
-- [GitLab CI enrichment and restart-safe signal deduplication](https://github.com/sausheong/sidecar/pull/1)
-- [Compatible AI gateways and Cohere embeddings](https://github.com/sausheong/sidecar/pull/2)
-- [Deterministic verification and GitHub/GitLab change delivery](https://github.com/sausheong/sidecar/pull/3)
+| Status | Capability | Design and acceptance criteria |
+| --- | --- | --- |
+| Open [PR #1](https://github.com/sausheong/sidecar/pull/1) | GitLab CI failure diagnostics and restart-safe signal deduplication | [SHIP Sidecar enablement](openspec/changes/ship-sidecar-enablement/) |
+| Open [PR #2](https://github.com/sausheong/sidecar/pull/2) | Compatible Platform AI gateways and Cohere embeddings | [PAi model and embedding support](openspec/changes/pai-model-embedding-support/) |
+| Open [PR #3](https://github.com/sausheong/sidecar/pull/3) | Workspace-aware repair, deterministic verification, and GitHub/GitLab change delivery | [Workspace-aware repair verification](openspec/changes/workspace-aware-repair-verification/) · [Provider-aware change delivery](openspec/changes/provider-aware-change-delivery/) |
+| Planned after the foundational PRs merge | Sanitized agent traces and deterministic coding/evaluator completion | [Durable agent execution tracing](openspec/changes/durable-agent-execution-tracing/) · [Deterministic agent completion](openspec/changes/deterministic-agent-completion/) |
+| Planned after lifecycle work merges | Immutable evaluated repair change sets, generated-artifact exclusion, and deployment-owned Git identity/signing | [Immutable repair change set](openspec/changes/immutable-repair-change-set/) |
 
-Until these changes are merged and released upstream, this fork remains the
-reference implementation for SHIP-HATS deployments. Detailed deployment
-context is available in [SHIP-HATS.md](SHIP-HATS.md), with feature contracts
-under [`openspec/changes`](openspec/changes/).
+The OpenSpecs describe the problem, intended behaviour, security boundaries,
+and testable acceptance criteria for each capability. Deployment-specific
+context remains in [SHIP-HATS.md](SHIP-HATS.md).
 
 ## How It Works
 
