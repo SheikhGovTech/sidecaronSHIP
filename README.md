@@ -1,6 +1,6 @@
 # Sidecar (SHIP-HATS Fork)
 
-> **This is a fork of [sausheong/sidecar](https://github.com/sausheong/sidecar)** with GitLab SHIP-HATS CI signal enrichment. See [SHIP-HATS.md](SHIP-HATS.md) for what changed and why. The consolidated OpenSpec is [ship-sidecar-enablement](openspec/changes/ship-sidecar-enablement/).
+> **This is a fork of [sausheong/sidecar](https://github.com/sausheong/sidecar)** with GitLab SHIP-HATS CI signal enrichment. Its fork-specific contract is documented in the [SHIP Sidecar enablement OpenSpec](openspec/changes/ship-sidecar-enablement/).
 
 An autonomous engineering agent that attaches to any software project as a persistent sidecar process and continuously maintains it. Sidecar watches for signals (git commits, CI failures, scheduled sweeps, log anomalies, metric alerts, uptime checks), triages each one, and applies the appropriate fix — committing directly, opening a PR, recording a suggestion, or notifying a human — based on your configured autonomy level. Before any change ships, an independent adversarial evaluator runs the tests over the diff and can veto it.
 
@@ -18,8 +18,16 @@ following reusable capabilities are reviewed upstream.
 | Planned after lifecycle work merges | Immutable evaluated repair change sets, generated-artifact exclusion, and deployment-owned Git identity/signing | [Immutable repair change set](openspec/changes/immutable-repair-change-set/) |
 
 The OpenSpecs describe the problem, intended behaviour, security boundaries,
-and testable acceptance criteria for each capability. Deployment-specific
-context remains in [SHIP-HATS.md](SHIP-HATS.md).
+and testable acceptance criteria for each capability.
+
+### SHIP-HATS deployment note
+
+The fork enriches a failed GitLab pipeline with bounded failed-job diagnostics,
+changed-file scope, optional commit context, and flake evidence before triage.
+This lets Sidecar distinguish actionable test or build failures from likely
+transient infrastructure failures. SHIP-HATS and Platform AI endpoint
+configuration, including configurable CI error patterns, is specified in the
+[SHIP Sidecar enablement OpenSpec](openspec/changes/ship-sidecar-enablement/).
 
 ## How It Works
 
