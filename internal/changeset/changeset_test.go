@@ -113,18 +113,18 @@ func TestPreparedIndexMutationFailsClosed(t *testing.T) {
 	assert.Error(t, changeset.Commit(dir, snap, "sidecar fix"))
 }
 
-func TestCommitControlsIdentityAndSigning(t *testing.T) {
+func TestCommitUsesConfiguredIdentityAndSigningPolicy(t *testing.T) {
 	dir, base := repo(t)
 	run(t, dir, "config", "user.name", "Agent")
 	run(t, dir, "config", "user.email", "agent@example.com")
-	run(t, dir, "config", "commit.gpgsign", "true")
+	run(t, dir, "config", "commit.gpgsign", "false")
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "source.go"), []byte("package sample\n// fixed\n"), 0o600))
 	snap, err := changeset.Prepare(dir, base, nil)
 	require.NoError(t, err)
 	require.NoError(t, changeset.Commit(dir, snap, "sidecar fix"))
 
-	assert.Equal(t, "Sidecar <sidecar@sidecar.dev>", run(t, dir, "show", "-s", "--format=%an <%ae>", "HEAD"))
-	assert.Equal(t, "Sidecar <sidecar@sidecar.dev>", run(t, dir, "show", "-s", "--format=%cn <%ce>", "HEAD"))
+	assert.Equal(t, "Agent <agent@example.com>", run(t, dir, "show", "-s", "--format=%an <%ae>", "HEAD"))
+	assert.Equal(t, "Agent <agent@example.com>", run(t, dir, "show", "-s", "--format=%cn <%ce>", "HEAD"))
 	assert.Equal(t, "N", run(t, dir, "show", "-s", "--format=%G?", "HEAD"))
 }
 
@@ -144,7 +144,7 @@ func TestAgentSelfCommitCannotBypassFilteringOrSigning(t *testing.T) {
 
 	assert.Equal(t, []changeset.PathChange{{Status: "M", Path: "source.go"}}, snap.Paths)
 	assert.Equal(t, []string{".harness/agent.log"}, snap.Excluded)
-	assert.Equal(t, "Sidecar <sidecar@sidecar.dev>", run(t, dir, "show", "-s", "--format=%an <%ae>", "HEAD"))
+	assert.Equal(t, "Agent <agent@example.com>", run(t, dir, "show", "-s", "--format=%an <%ae>", "HEAD"))
 	assert.Equal(t, "source.go", run(t, dir, "show", "--pretty=", "--name-only", "HEAD"))
 }
 

@@ -18,11 +18,6 @@ var BuiltInExclusions = []string{
 	"htmlcov/**", "coverage.xml",
 }
 
-const (
-	commitName  = "Sidecar"
-	commitEmail = "sidecar@sidecar.dev"
-)
-
 type PathChange struct {
 	Status string `json:"status"`
 	Path   string `json:"path"`
@@ -88,12 +83,10 @@ func Commit(repo string, approved Snapshot, message string) error {
 	if len(approved.Paths) == 0 {
 		return nil
 	}
-	if _, err := git(repo,
-		"-c", "user.name="+commitName,
-		"-c", "user.email="+commitEmail,
-		"-c", "commit.gpgsign=false",
-		"commit", "-m", message,
-	); err != nil {
+	// Commit identity and signing are deployment policy.  In particular, a
+	// downstream runtime may require a verified GitLab email and signed
+	// commits, so do not override its Git configuration here.
+	if _, err := git(repo, "commit", "-m", message); err != nil {
 		return fmt.Errorf("commit prepared repair: %w", err)
 	}
 	return nil
