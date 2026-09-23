@@ -24,8 +24,33 @@ type Config struct {
 	Skills        SkillsConfig         `yaml:"skills"`
 	Budget        BudgetConfig         `yaml:"budget"`
 	Delivery      DeliveryConfig       `yaml:"delivery"`
+	Output        OutputConfig         `yaml:"output"`
 	Observability ObservabilityConfig  `yaml:"observability"`
 	Workflow      WorkflowConfig       `yaml:"workflow"`
+}
+
+// OutputConfig controls which worktree outputs may enter a repair change set.
+type OutputConfig struct {
+	Exclude []string `yaml:"exclude"`
+}
+
+func (c *Config) ValidateOutput() error {
+	for i, pattern := range c.Output.Exclude {
+		if strings.TrimSpace(pattern) == "" {
+			return fmt.Errorf("output.exclude[%d]: pattern is required", i)
+		}
+		if filepath.IsAbs(pattern) || strings.HasPrefix(pattern, "!") {
+			return fmt.Errorf("output.exclude[%d]: pattern must be relative and cannot negate exclusions", i)
+		}
+		clean := filepath.Clean(filepath.FromSlash(pattern))
+		if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("output.exclude[%d]: pattern escapes the workspace", i)
+		}
+		if _, err := filepath.Match(strings.ReplaceAll(pattern, "**", "*"), "validate"); err != nil {
+			return fmt.Errorf("output.exclude[%d]: malformed pattern: %w", i, err)
+		}
+	}
+	return nil
 }
 
 type WorkflowConfig struct {
@@ -509,6 +534,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config %q: %w", path, err)
 	}
 	if err := cfg.ValidateVerification(); err != nil {
+		return nil, fmt.Errorf("validating config %q: %w", path, err)
+	}
+	if err := cfg.ValidateOutput(); err != nil {
 		return nil, fmt.Errorf("validating config %q: %w", path, err)
 	}
 	if err := cfg.ValidateAutonomy(); err != nil {

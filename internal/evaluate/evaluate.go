@@ -19,6 +19,7 @@ import (
 	"github.com/sausheong/harness/tool"
 	"github.com/sausheong/harness/tools/bash"
 	"github.com/sausheong/harness/tools/file"
+	"github.com/sausheong/sidecar/internal/changeset"
 	"github.com/sausheong/sidecar/internal/config"
 	"github.com/sausheong/sidecar/internal/verification"
 )
@@ -90,11 +91,24 @@ func BuildEvalMessage(taskSummary, diff string) string {
 // BuildEvalMessageWithEvidence includes the already-executed deterministic
 // checks so the evaluator can assess rather than repeat them.
 func BuildEvalMessageWithEvidence(taskSummary, diff string, results []verification.Result) string {
+	return BuildPreparedEvalMessage(taskSummary, diff, nil, results)
+}
+
+// BuildPreparedEvalMessage includes the authoritative path manifest and the
+// already-executed deterministic checks alongside the staged patch.
+func BuildPreparedEvalMessage(taskSummary, diff string, manifest []changeset.PathChange, results []verification.Result) string {
 	evidence := VerificationEvidenceBlock(results)
 	if evidence == "" {
 		evidence = "No configured deterministic verification evidence was supplied."
 	}
+	manifestJSON, err := json.Marshal(manifest)
+	if err != nil {
+		manifestJSON = []byte("[]")
+	}
 	return fmt.Sprintf(`Task the generator was asked to do: %s
+
+Approved changed-path manifest:
+%s
 
 Deterministic verification evidence:
 %s
@@ -105,7 +119,7 @@ your verdict immediately once material checks are resolved.
 
 --- DIFF ---
 %s
---- END DIFF ---`, taskSummary, evidence, diff)
+--- END DIFF ---`, taskSummary, manifestJSON, evidence, diff)
 }
 
 // VerificationEvidenceBlock renders bounded structured evidence. Callers are
@@ -180,22 +194,9 @@ func ParseVerdict(raw string) (Verdict, error) {
 // silently bypass this gate). If baseRef is "" it falls back to "HEAD" to
 // preserve the in-repo (non-worktree) behavior.
 //
-// To see EXACTLY what the commit step will ship, we first `git add -A` (which
-// stages untracked files too) and then diff the index against base with
-// `git diff --cached <base>`. This is required because `git diff <base>` omits
-// untracked files: an agent that wrote a brand-new file without `git add` would
-// otherwise present an empty/partial diff to the evaluator and slip through,
-// while output.CommitInPlaceFrom (which also stages with `git add -A`) would
-// still commit and ship the unevaluated file. Staging here makes the gate judge
-// precisely the set of changes that gets committed.
-//
-// The `git add -A` is unconditional, mirroring CommitInPlaceFrom. For the
-// worktree path (the only path that passes a non-empty baseRef) this is wholly
-// safe — the worktree is ephemeral and gets staged with `-A` at commit time
-// anyway. For the degraded in-repo fallback (baseRef == "" → "HEAD") it does
-// touch the real index, but that path already shares its working tree with the
-// commit step and staging there is consistent with how the change ultimately
-// ships; the fallback is the accepted degraded path.
+// The caller prepares the authoritative staged change set before evaluation.
+// Evaluation is read-only with respect to the index and reviews exactly
+// `git diff --cached <base>`.
 //
 // On any setup/run error the caller should fail closed (treat as REJECT); this
 // function returns the error so the caller can record it.
@@ -228,16 +229,17 @@ func EvaluateObserved(ctx context.Context, provider llm.LLMProvider, model, work
 // EvaluateObservedWithEvidence enforces two phases: a bounded investigation
 // with guarded tools and one reserved, tool-free verdict request.
 func EvaluateObservedWithEvidence(ctx context.Context, provider llm.LLMProvider, model, workDir, baseRef, taskSummary string, commands []config.VerificationCommand, evidence []verification.Result, maxTurns int, observe EventObserver) (Verdict, llm.Usage, error) {
+	return EvaluatePreparedObservedWithEvidence(ctx, provider, model, workDir, baseRef, taskSummary, nil, commands, evidence, maxTurns, observe)
+}
+
+// EvaluatePreparedObservedWithEvidence evaluates the authoritative staged
+// patch together with its approved changed-path manifest.
+func EvaluatePreparedObservedWithEvidence(ctx context.Context, provider llm.LLMProvider, model, workDir, baseRef, taskSummary string, manifest []changeset.PathChange, commands []config.VerificationCommand, evidence []verification.Result, maxTurns int, observe EventObserver) (Verdict, llm.Usage, error) {
 	if baseRef == "" {
 		baseRef = "HEAD"
 	}
 	if maxTurns <= 0 {
 		maxTurns = 20
-	}
-	// Stage everything (including untracked files) so the index reflects exactly
-	// what CommitInPlaceFrom would commit.
-	if addOut, err := exec.Command("git", "-C", workDir, "add", "-A").CombinedOutput(); err != nil {
-		return Verdict{}, llm.Usage{}, fmt.Errorf("git add -A: %w\n%s", err, strings.TrimSpace(string(addOut)))
 	}
 	diffOut, err := exec.Command("git", "-C", workDir, "diff", "--cached", baseRef).CombinedOutput()
 	if err != nil {
@@ -249,7 +251,7 @@ func EvaluateObservedWithEvidence(ctx context.Context, provider llm.LLMProvider,
 		return Verdict{Outcome: "pass", Pass: true, Reasons: "no changes to evaluate"}, llm.Usage{}, nil
 	}
 
-	message := BuildEvalMessageWithEvidence(taskSummary, diff, evidence)
+	message := BuildPreparedEvalMessage(taskSummary, diff, manifest, evidence)
 	investigationTurns := maxTurns - 1
 	if investigationTurns > 8 {
 		investigationTurns = 8

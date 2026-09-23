@@ -53,10 +53,10 @@ func TestPRCreator_FallbackAPI(t *testing.T) {
 	local, _ := initRepoWithRemote(t)
 
 	require.NoError(t, os.WriteFile(filepath.Join(local, "fix.go"), []byte("package main"), 0644))
-	out := output.New(local)
-	branch, err := out.CommitBranch("task-pr-test", "sidecar: test fix")
-	require.NoError(t, err)
-	require.NotEmpty(t, branch)
+	branch := "sidecar/task-pr-test"
+	runGit(t, local, "checkout", "-b", branch)
+	runGit(t, local, "add", "fix.go")
+	runGit(t, local, "commit", "-m", "sidecar: test fix")
 
 	pc := output.NewPRCreatorWithBaseURL(local, "org/repo", "testtoken", server.URL)
 	url, err := pc.Create(branch, "sidecar: test fix", "## Sidecar automated fix\n\nTest PR body.")

@@ -12,6 +12,7 @@ import (
 
 	"github.com/sausheong/harness/llm"
 	"github.com/sausheong/harness/llm/llmtest"
+	"github.com/sausheong/sidecar/internal/changeset"
 	"github.com/sausheong/sidecar/internal/config"
 	"github.com/sausheong/sidecar/internal/evaluate"
 	"github.com/sausheong/sidecar/internal/verification"
@@ -105,6 +106,8 @@ func evaluatorRepo(t *testing.T) string {
 	output, err = exec.Command("git", "-C", dir, "commit", "-m", "initial").CombinedOutput()
 	require.NoError(t, err, string(output))
 	require.NoError(t, os.WriteFile(dir+"/file.txt", []byte("after\n"), 0o600))
+	output, err = exec.Command("git", "-C", dir, "add", "file.txt").CombinedOutput()
+	require.NoError(t, err, string(output))
 	return dir
 }
 
@@ -113,6 +116,7 @@ func TestEvaluateFinalizesWithoutToolsAfterMalformedInvestigation(t *testing.T) 
 	provider := &completionProvider{respond: func(call int, request llm.ChatRequest) []llm.ChatEvent {
 		if call == 1 {
 			assert.NotEmpty(t, request.Tools)
+			assert.Contains(t, request.Messages[len(request.Messages)-1].Content, `{"status":"M","path":"file.txt"}`)
 			assert.Contains(t, request.Messages[len(request.Messages)-1].Content, "exit_code: 0")
 			return textDone("The checks look sufficient but this is not JSON.")
 		}
@@ -120,7 +124,8 @@ func TestEvaluateFinalizesWithoutToolsAfterMalformedInvestigation(t *testing.T) 
 		return textDone(`{"outcome":"pass","reasons":"verified","evidence":["verification:tests"]}`)
 	}}
 	result := verification.Result{Name: "tests", ExitCode: 0, Duration: time.Second, Output: "all tests passed"}
-	verdict, _, err := evaluate.EvaluateObservedWithEvidence(context.Background(), provider, "model", repo, "HEAD", "fix", nil, []verification.Result{result}, 20, nil)
+	manifest := []changeset.PathChange{{Status: "M", Path: "file.txt"}}
+	verdict, _, err := evaluate.EvaluatePreparedObservedWithEvidence(context.Background(), provider, "model", repo, "HEAD", "fix", manifest, nil, []verification.Result{result}, 20, nil)
 	require.NoError(t, err)
 	assert.True(t, verdict.Pass)
 	assert.Equal(t, "pass", verdict.Outcome)
@@ -137,6 +142,22 @@ func TestEvaluateStopsOnEarlyStructuredVerdict(t *testing.T) {
 	assert.False(t, verdict.Pass)
 	assert.Equal(t, "reject", verdict.Outcome)
 	assert.Len(t, provider.requests, 1)
+}
+
+func TestEvaluateInspectsOnlyApprovedStagedDiff(t *testing.T) {
+	repo := evaluatorRepo(t)
+	require.NoError(t, os.WriteFile(repo+"/unstaged.txt", []byte("must stay outside evaluation\n"), 0o600))
+	provider := &completionProvider{respond: func(_ int, request llm.ChatRequest) []llm.ChatEvent {
+		message := request.Messages[len(request.Messages)-1].Content
+		assert.Contains(t, message, `{"status":"M","path":"file.txt"}`)
+		assert.Contains(t, message, "file.txt")
+		assert.NotContains(t, message, "unstaged.txt")
+		return textDone(`{"outcome":"pass","reasons":"approved staged diff only","evidence":["diff:file.txt"]}`)
+	}}
+	manifest := []changeset.PathChange{{Status: "M", Path: "file.txt"}}
+	verdict, _, err := evaluate.EvaluatePreparedObservedWithEvidence(context.Background(), provider, "model", repo, "HEAD", "fix", manifest, nil, nil, 20, nil)
+	require.NoError(t, err)
+	assert.True(t, verdict.Pass)
 }
 
 func TestEvaluateMalformedFinalVerdictIsIncomplete(t *testing.T) {

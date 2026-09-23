@@ -244,6 +244,15 @@ func TestValidateVerificationRejectsInvalidCommands(t *testing.T) {
 	}
 }
 
+func TestValidateOutputExclusions(t *testing.T) {
+	valid := &config.Config{Output: config.OutputConfig{Exclude: []string{"dist/**", "coverage.xml"}}}
+	assert.NoError(t, valid.ValidateOutput())
+	for _, pattern := range []string{"", "/tmp/file", "../secret", "!.harness/**", "[bad"} {
+		cfg := &config.Config{Output: config.OutputConfig{Exclude: []string{pattern}}}
+		assert.Error(t, cfg.ValidateOutput(), pattern)
+	}
+}
+
 func TestSkillsDir_DefaultWhenEmpty(t *testing.T) {
 	cfg := &config.Config{}
 	assert.Equal(t, ".sidecar/skills", cfg.SkillsDir())

@@ -24,6 +24,7 @@ import (
 	"github.com/sausheong/harness/tools/file"
 	"github.com/sausheong/sidecar/internal/adapter"
 	"github.com/sausheong/sidecar/internal/agenttrace"
+	"github.com/sausheong/sidecar/internal/changeset"
 	"github.com/sausheong/sidecar/internal/completion"
 	"github.com/sausheong/sidecar/internal/config"
 	"github.com/sausheong/sidecar/internal/evaluate"
@@ -168,6 +169,7 @@ type Loop struct {
 	memTool     *harnessmem.MemoryTool   // nil when embedding is nil
 	dispatcher  *notify.Dispatcher       // nil when no notifications configured
 	skills      runtime.SkillProvider    // nil when no skills dir present
+	afterCommit func(string) error       // test-only integrity fault injection
 	retentionMu sync.Mutex
 	retainedAt  time.Time
 }
@@ -503,6 +505,21 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		StopReason: codingTerminal, Attempt: 1, RequestsUsed: codingEvidence.Requests,
 		TraceID: codingEvidence.TraceID, Summary: safeCodingSummary}).Payload())
 
+	var approved *changeset.Snapshot
+	if ShipsCode(tr.AutonomyLevel) && codingChanged {
+		if wt == nil {
+			return l.failChangeSet(ctx, sig, task, wt, &wtCleanup, "prepare", errors.New("code-shipping task has no isolated worktree"))
+		}
+		snapshot, prepareErr := changeset.Prepare(workDir, wt.Base, l.cfg.Output.Exclude)
+		if prepareErr != nil {
+			return l.failChangeSet(ctx, sig, task, wt, &wtCleanup, "prepare", prepareErr)
+		}
+		approved = &snapshot
+		_ = l.db.AppendTaskEvent(ctx, task.ID, "repair_change_set_prepared", changeSetPayload(snapshot))
+		// Filtering may intentionally remove every generated output.
+		codingChanged = len(snapshot.Paths) > 0
+	}
+
 	var evaluatorEvidence agenttrace.Summary
 	var verificationEvidence []verification.Result
 	evaluationStatus := "not_run"
@@ -515,18 +532,22 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		// agent's changes even if it self-committed (HEAD would have moved).
 		// In the in-repo fallback (wt == nil) baseRef is "" → Evaluate uses HEAD.
 		baseRef := codingBaseRef
-		changed, changeErr := workspaceHasChanges(workDir, baseRef)
-		if changeErr != nil {
-			return l.failVerification(ctx, sig, task, wt, &wtCleanup, "change_detection", verification.Result{Err: changeErr})
-		}
-		if !changed {
+		if !codingChanged {
 			slog.Info("sidecar: no changes; skipping verification and evaluator", "task", task.ID)
 		} else {
 			for _, command := range verificationCommands {
 				_ = l.db.AppendTaskEvent(ctx, task.ID, "verification_started", map[string]any{"command": command.Name})
 				result := verification.RunOne(ctx, workDir, command)
+				if err := changeset.VerifyPrepared(workDir, *approved); err != nil {
+					return l.failChangeSet(ctx, sig, task, wt, &wtCleanup, "verification", fmt.Errorf("prepared index changed during %q: %w", command.Name, err))
+				}
 				if result.Err != nil || result.ExitCode != 0 {
-					return l.failVerification(ctx, sig, task, wt, &wtCleanup, command.Name, result)
+					_ = l.db.AppendTaskEvent(ctx, task.ID, "verification_failed", verificationEvent(result))
+					verificationErr := fmt.Errorf("verification %q failed with exit code %d", command.Name, result.ExitCode)
+					if result.Err != nil {
+						verificationErr = fmt.Errorf("verification %q failed: %w", command.Name, result.Err)
+					}
+					return l.failChangeSet(ctx, sig, task, wt, &wtCleanup, "verification", verificationErr)
 				}
 				verificationEvidence = append(verificationEvidence, result)
 				_ = l.db.AppendTaskEvent(ctx, task.ID, "verification_succeeded", verificationEvent(result))
@@ -534,10 +555,13 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 
 			evaluatorTrace := agenttrace.New(l.db, task.ID, "evaluator", 1, workDir, traceCfg, l.traceSecrets()...)
 			evaluatorInput := sanitizeVerificationEvidence(verificationEvidence, l.traceSecrets()...)
-			verdict, evalUsage, evalErr := evaluate.EvaluateObservedWithEvidence(ctx, l.provider, models.Evaluator, workDir, baseRef,
-				task.Summary, verificationCommands, evaluatorInput, l.cfg.EvaluatorMaxTurns(), evaluatorTrace.Handle)
+			verdict, evalUsage, evalErr := evaluate.EvaluatePreparedObservedWithEvidence(ctx, l.provider, models.Evaluator, workDir, baseRef,
+				task.Summary, approved.Paths, verificationCommands, evaluatorInput, l.cfg.EvaluatorMaxTurns(), evaluatorTrace.Handle)
 			if flushErr := evaluatorTrace.Flush(ctx); flushErr != nil && evalErr == nil {
 				evalErr = fmt.Errorf("persisting evaluator trace: %w", flushErr)
+			}
+			if err := changeset.VerifyPrepared(workDir, *approved); err != nil {
+				return l.failChangeSet(ctx, sig, task, wt, &wtCleanup, "evaluation", fmt.Errorf("prepared index changed during evaluation: %w", err))
 			}
 			evaluatorEvidence = evaluatorTrace.Summary()
 			safeEvalErr := ""
@@ -621,24 +645,28 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		}
 	}
 
-	// commit creates the output branch. In a worktree it commits in place and
-	// returns the worktree's branch; in-repo it falls back to CommitBranch.
+	// commit uses only the approved index and verifies that the resulting commit
+	// is byte-for-byte equivalent before any publication can begin.
 	commit := func() (string, error) {
-		out := output.New(workDir)
 		if wt != nil {
-			// Detect changes relative to the worktree base ref so an agent
-			// self-commit still routes to PR/completed-with-branch rather than
-			// being misread as "no changes".
-			changed, err := out.CommitInPlaceFrom(wt.Base, "sidecar: "+task.Summary)
-			if err != nil {
-				return "", err
-			}
-			if !changed {
+			if approved == nil || len(approved.Paths) == 0 {
 				return output.BranchNoChanges, nil
 			}
+			if err := changeset.Commit(workDir, *approved, "sidecar: "+task.Summary); err != nil {
+				return "", err
+			}
+			if l.afterCommit != nil {
+				if err := l.afterCommit(workDir); err != nil {
+					return "", fmt.Errorf("post-commit integrity hook: %w", err)
+				}
+			}
+			if err := changeset.VerifyCommitted(workDir, *approved); err != nil {
+				return "", err
+			}
+			_ = l.db.AppendTaskEvent(ctx, task.ID, "repair_change_set_verified", changeSetPayload(*approved))
 			return wt.Branch, nil
 		}
-		return out.CommitBranch(task.ID.String(), "sidecar: "+task.Summary)
+		return "", errors.New("code-shipping task has no isolated worktree")
 	}
 
 	// ── Output routing ───────────────────────────────────────────────────────
@@ -654,9 +682,7 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 	case "pull-request":
 		branch, err := commit()
 		if err != nil {
-			_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
-			l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
-			return err
+			return l.failChangeSet(ctx, sig, task, wt, &wtCleanup, "commit_or_integrity", err)
 		}
 		if branch == output.BranchNoChanges {
 			slog.Info("sidecar: no changes to commit", "task", task.ID)
@@ -710,9 +736,7 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 	case "auto-commit":
 		branch, err := commit()
 		if err != nil {
-			_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
-			l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
-			return err
+			return l.failChangeSet(ctx, sig, task, wt, &wtCleanup, "commit_or_integrity", err)
 		}
 		if branch != output.BranchNoChanges {
 			slog.Info("sidecar committed changes", "branch", branch, "task", task.ID)
@@ -730,6 +754,50 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		l.discardWorktree(task.ID.String(), wt, &wtCleanup)
 		return fmt.Errorf("invalid autonomy level %q", tr.AutonomyLevel)
 	}
+}
+
+func changeSetPayload(snapshot changeset.Snapshot) map[string]any {
+	paths, pathsTruncated := boundedPathChanges(snapshot.Paths, 200)
+	excluded, excludedTruncated := boundedStrings(snapshot.Excluded, 200)
+	return map[string]any{
+		"base": snapshot.Base, "paths": paths, "path_count": len(snapshot.Paths), "paths_truncated": pathsTruncated,
+		"excluded": excluded, "excluded_count": len(snapshot.Excluded), "excluded_truncated": excludedTruncated,
+		"digest": snapshot.Digest,
+	}
+}
+
+func boundedPathChanges(values []changeset.PathChange, limit int) ([]changeset.PathChange, bool) {
+	count := len(values)
+	if count > limit {
+		values = values[:limit]
+	}
+	bounded := make([]changeset.PathChange, len(values))
+	for i, value := range values {
+		bounded[i] = changeset.PathChange{Status: boundEvidence(value.Status, 16), Path: boundEvidence(value.Path, 1024)}
+	}
+	return bounded, count > limit
+}
+
+func boundedStrings(values []string, limit int) ([]string, bool) {
+	count := len(values)
+	if count > limit {
+		values = values[:limit]
+	}
+	bounded := make([]string, len(values))
+	for i, value := range values {
+		bounded[i] = boundEvidence(value, 1024)
+	}
+	return bounded, count > limit
+}
+
+func (l *Loop) failChangeSet(ctx context.Context, sig adapter.Signal, task *store.Task, wt *worktree.Worktree, cleanup *func() error, phase string, changeErr error) error {
+	_ = l.db.AppendTaskEvent(ctx, task.ID, "repair_change_set_failed", map[string]any{
+		"phase": phase, "error": boundEvidence(agenttrace.Redact(changeErr.Error(), l.traceSecrets()...), 4096),
+	})
+	_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
+	l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
+	l.discardWorktree(task.ID.String(), wt, cleanup)
+	return fmt.Errorf("repair change set %s: %w", phase, changeErr)
 }
 
 func (l *Loop) failDelivery(ctx context.Context, sig adapter.Signal, task *store.Task, branch string, target output.DeliveryTarget, result output.PublishResult, deliveryErr error) error {

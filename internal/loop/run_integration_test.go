@@ -4,8 +4,13 @@ package loop_test
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -334,6 +339,27 @@ func TestRun_VerificationFailureFailsAndDeletesBranch(t *testing.T) {
 	assert.Empty(t, strings.TrimSpace(string(out)), "failed verification must delete the task branch")
 }
 
+func TestRun_VerificationIndexMutationFailsChangeSet(t *testing.T) {
+	repo := initRepo(t)
+	cfg := bugFixCfg()
+	cfg.Verification.Commands = []config.VerificationCommand{{Name: "mutating-test", Run: "printf 'unexpected\\n' > unexpected.txt && /usr/bin/git add unexpected.txt"}}
+	l, db, ws := newLoop(t, repo, &scriptedProvider{evalPass: true}, cfg)
+
+	err := l.Run(context.Background(), gitCommitSignal())
+	require.ErrorContains(t, err, "prepared index changed")
+	assert.Equal(t, loop.StatusFailed, lastStatus(t, db, ws))
+	tasks, taskErr := db.ListTasks(context.Background(), ws.ID, 1)
+	require.NoError(t, taskErr)
+	events, eventErr := db.GetTaskEvents(context.Background(), tasks[0].ID)
+	require.NoError(t, eventErr)
+	var eventTypes []string
+	for _, event := range events {
+		eventTypes = append(eventTypes, event.Type)
+	}
+	assert.Contains(t, eventTypes, "repair_change_set_failed")
+	assert.NotContains(t, eventTypes, "evaluation")
+}
+
 func TestRun_SelfCommitThenVerificationFailureDeletesBranch(t *testing.T) {
 	repo := initRepo(t)
 	cfg := bugFixCfg()
@@ -396,6 +422,59 @@ func TestRun_DeliveryFailureCannotComplete(t *testing.T) {
 	err = l.Run(context.Background(), gitCommitSignal())
 	assert.Error(t, err)
 	assert.Equal(t, loop.StatusFailed, lastStatus(t, db, ws))
+}
+
+func TestRun_CommittedMismatchFailsNotifiesAndSkipsPublication(t *testing.T) {
+	repo := initRepo(t)
+	bare := filepath.Join(t.TempDir(), "remote.git")
+	out, err := exec.Command("git", "init", "--bare", bare).CombinedOutput()
+	require.NoError(t, err, string(out))
+	out, err = exec.Command("git", "-C", repo, "remote", "add", "origin", bare).CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	var notified string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+		notified, _ = payload["event"].(string)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	cfg := bugFixCfg()
+	cfg.Autonomy.BugFixes = "pull-request"
+	cfg.Delivery = config.DeliveryConfig{Provider: "github", Repo: "org/repo", Remote: "origin", BaseBranch: "main"}
+	cfg.Notifications = []config.NotificationConfig{{Provider: "webhook", URL: server.URL, On: []string{"failed"}}}
+	l, db, ws := newLoop(t, repo, &scriptedProvider{evalPass: true}, cfg)
+	loop.SetAfterCommitForTest(l, func(workDir string) error {
+		if err := os.WriteFile(filepath.Join(workDir, "unexpected.txt"), []byte("unexpected\n"), 0o600); err != nil {
+			return err
+		}
+		if output, err := exec.Command("git", "-C", workDir, "add", "unexpected.txt").CombinedOutput(); err != nil {
+			return fmt.Errorf("stage unexpected file: %w: %s", err, output)
+		}
+		if output, err := exec.Command("git", "-C", workDir, "-c", "commit.gpgsign=false", "commit", "--amend", "--no-edit").CombinedOutput(); err != nil {
+			return fmt.Errorf("amend unexpected file: %w: %s", err, output)
+		}
+		return nil
+	})
+
+	err = l.Run(context.Background(), gitCommitSignal())
+	require.ErrorContains(t, err, "patch digest mismatch")
+	assert.Equal(t, loop.StatusFailed, lastStatus(t, db, ws))
+	assert.Equal(t, "failed", notified)
+	tasks, taskErr := db.ListTasks(context.Background(), ws.ID, 1)
+	require.NoError(t, taskErr)
+	events, eventErr := db.GetTaskEvents(context.Background(), tasks[0].ID)
+	require.NoError(t, eventErr)
+	var eventTypes []string
+	for _, event := range events {
+		eventTypes = append(eventTypes, event.Type)
+	}
+	assert.Contains(t, eventTypes, "repair_change_set_failed")
+	refs, refErr := exec.Command("git", "--git-dir", bare, "for-each-ref", "--format=%(refname)", "refs/heads/sidecar/").CombinedOutput()
+	require.NoError(t, refErr, string(refs))
+	assert.Empty(t, strings.TrimSpace(string(refs)))
 }
 
 func TestRun_BudgetExceededSkips(t *testing.T) {

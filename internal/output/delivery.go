@@ -17,7 +17,10 @@ import (
 	"github.com/sausheong/sidecar/internal/config"
 )
 
-const gitlabAPIBase = "https://gitlab.com/api/v4"
+const (
+	BranchNoChanges = ""
+	gitlabAPIBase   = "https://gitlab.com/api/v4"
+)
 
 type DeliveryTarget struct {
 	Provider   string

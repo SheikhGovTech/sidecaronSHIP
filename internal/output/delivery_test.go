@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sausheong/sidecar/internal/changeset"
 	"github.com/sausheong/sidecar/internal/config"
 	"github.com/sausheong/sidecar/internal/output"
 	"github.com/stretchr/testify/assert"
@@ -59,6 +60,13 @@ func deliveryRepo(t *testing.T) (string, string) {
 		require.NoError(t, err, string(out))
 	}
 	return repo, bare
+}
+
+func deliveryGitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+	require.NoError(t, err, string(out))
+	return strings.TrimSpace(string(out))
 }
 
 func TestResolveDeliveryExplicitGitLab(t *testing.T) {
@@ -131,6 +139,35 @@ func TestGitHubPublisherCreatesPullRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, result.Pushed)
 	assert.Equal(t, "https://github.example/group/project/pull/1", result.URL)
+}
+
+func TestMatchingApprovedCommitProceedsToProviderDelivery(t *testing.T) {
+	repo, bare := deliveryRepo(t)
+	base := deliveryGitOutput(t, repo, "rev-parse", "HEAD")
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "fix.go"), []byte("package sample\n"), 0o644))
+	snapshot, err := changeset.Prepare(repo, base, nil)
+	require.NoError(t, err)
+	require.NoError(t, changeset.Commit(repo, snapshot, "sidecar: fix"))
+	require.NoError(t, changeset.VerifyCommitted(repo, snapshot))
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"html_url":"https://github.example/org/repo/pull/1"}`))
+	}))
+	defer server.Close()
+	target := output.DeliveryTarget{Provider: "github", Repo: "org/repo", Remote: "origin", RemoteURL: bare, APIBaseURL: server.URL, BaseBranch: "main"}
+	result, err := output.NewPublisher(target).Publish(context.Background(), output.PublishRequest{
+		RepoPath: repo, Branch: "sidecar/task-1", Title: "sidecar: fix",
+	})
+	require.NoError(t, err)
+	assert.True(t, result.Pushed)
+	assert.Equal(t, "https://github.example/org/repo/pull/1", result.URL)
+	assert.NotEmpty(t, deliveryGitOutput(t, bare, "show-ref", "refs/heads/sidecar/task-1"))
 }
 
 func TestGitHubPublisherCreatesDraftAndAppliesLabel(t *testing.T) {

@@ -123,6 +123,13 @@ Evaluator outcomes are distinct: **PASS**, **REJECT**, **INCOMPLETE** (no valid 
 
 Sidecar persists sanitized Harness action traces for coding, evaluator, and reviewer runtimes. Traces contain visible assistant output, bounded tool evidence, request-level usage, and terminal outcomes—not hidden chain-of-thought, complete prompts, file bodies, or raw unbounded logs. Request usage is recorded before error policy and worktree cleanup, so evaluator spend remains visible when a run exhausts its turn limit. Generated PRs/MRs include a bounded decision summary and durable trace IDs.
 
+Before verification, Sidecar normalizes any agent-created commits back to the
+task base, excludes runtime artifacts, and prepares one staged repair snapshot.
+The evaluator reviews that exact staged diff. Sidecar never restages afterward:
+it commits the approved index and compares the final commit's path manifest and
+patch digest with the approved snapshot before any push. A mismatch fails the
+task closed and is recorded through `repair_change_set_*` audit events.
+
 ### 6. Output routing
 
 After the evaluator passes, the output is routed based on the autonomy level resolved for that change type:
@@ -540,6 +547,15 @@ delivery:
   token: $GITLAB_TOKEN
   base_branch: main
 
+# Files that must never enter an autonomous repair commit. Sidecar also applies
+# built-in exclusions for Harness spill files, coverage data, and common test
+# reports. Patterns are relative to the isolated task worktree and cannot
+# negate the built-in exclusions.
+output:
+  exclude:
+    - "dist/**"
+    - "tmp/test-results/**"
+
 # How much autonomy Sidecar has per change type.
 # Levels: auto-commit | pull-request | suggest-only | notify
 autonomy:
@@ -629,6 +645,47 @@ notifications:
     webhook: $SLACK_WEBHOOK_URL
     on: [completed, failed, notified]
 ```
+
+### Immutable Repair Change Sets
+
+`output.exclude` is optional and defaults to an empty configured list. Sidecar
+always adds `.harness/**`, `.coverage`, `.coverage.*`, `.pytest_cache/**`,
+`htmlcov/**`, and `coverage.xml`. Configured patterns extend this deny-list;
+they cannot remove or negate built-in exclusions.
+
+Patterns use `/`-separated paths relative to the isolated task worktree. `*`
+matches within one path segment, `?` matches one non-separator character, and
+`**` crosses directory boundaries. Empty, malformed, absolute, negated, and
+parent-traversing patterns fail validation before task execution. Repository
+`.gitignore` rules suppress ignored untracked files during candidate discovery.
+Tracked modifications remain candidates even when an ignore rule matches them.
+Sidecar then applies built-in and configured exclusions to both tracked and
+remaining untracked candidates.
+
+After coding, Sidecar resolves the immutable task base, mixed-resets agent
+commits to that base, filters candidates, and stages the repair once. It records
+a sorted path/change-type manifest and SHA-256 digest of the canonical staged
+patch. Verification and evaluation cannot change this approved index. The
+evaluator receives the approved manifest and `git diff --cached <task-base>`;
+artifacts created afterward remain unstaged.
+
+The final commit uses only the prepared index with author and committer
+`Sidecar <sidecar@sidecar.dev>`. Sidecar explicitly disables ambient Git commit
+signing for this controlled commit, so agent or repository signing settings
+cannot alter delivery behavior. Before publication, Sidecar recomputes the
+manifest and digest from `<task-base>..HEAD`. A mismatch fails the task, emits a
+failed notification, and prevents push or change-request creation.
+
+The bounded audit trail uses these events:
+
+- `repair_change_set_prepared`: base, digest, bounded manifest, and bounded
+  exclusion summary.
+- `repair_change_set_verified`: matching approved snapshot before publication.
+- `repair_change_set_failed`: lifecycle phase plus bounded, redacted
+  diagnostics.
+
+These events never persist complete source patches, generated file contents,
+or credentials.
 
 ### Autonomy Levels
 
