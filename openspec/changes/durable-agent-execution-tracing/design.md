@@ -196,8 +196,8 @@ bounded page size. CLI/API presentation defaults to metadata and requires an
 explicit detailed view for sanitized payloads. Trace access follows the same
 authorization boundary as task access. No endpoint returns unredacted values.
 
-The governed delivery layer may embed a bounded sanitized action/decision
+The completion and delivery layer may embed a bounded sanitized action/decision
 summary and authorized trace reference in a pull or merge request. It SHALL NOT
 copy the complete trace into the code-hosting provider. Change-request outcome,
-draft status, labels, and human-approval policy remain the responsibility of
-the `governed-repair-workflows` change.
+incomplete status, draft warnings, and human-handoff policy remain the
+responsibility of the `deterministic-agent-completion` change.

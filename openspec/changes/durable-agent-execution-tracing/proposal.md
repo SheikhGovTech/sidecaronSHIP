@@ -53,6 +53,7 @@ responsible for emitting runtime events and enforcing the configured turn loop.
 
 This change does not store hidden reasoning, create a replayable prompt archive,
 retain raw CI logs, change model-provider wire formats, define evaluator retry
-or worktree-preservation policy, or replace metrics/log aggregation. Broader
-workflow recovery and preservation remain part of the separate governed repair
-workflow change.
+or worktree-preservation policy, or replace metrics/log aggregation. Agent
+completion and incomplete-work handoff are defined by the separate
+`deterministic-agent-completion` change; broader host workflow configuration
+remains future work.
