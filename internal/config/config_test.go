@@ -56,6 +56,13 @@ scope:
 	assert.Equal(t, []string{"secrets/"}, cfg.Scope.Exclude)
 }
 
+func TestLoadRepositoryExample(t *testing.T) {
+	cfg, err := config.Load(filepath.Join("..", "..", "sidecar.yaml"))
+	require.NoError(t, err)
+	assert.Equal(t, 20, cfg.EvaluatorMaxTurns())
+	assert.True(t, *cfg.EffectiveAgentTraces().Enabled)
+}
+
 func TestLoad_MissingFile(t *testing.T) {
 	_, err := config.Load("/does/not/exist/sidecar.yaml")
 	assert.Error(t, err)
@@ -151,6 +158,44 @@ func TestVerificationEnabled_RespectsExplicitTrue(t *testing.T) {
 	tr := true
 	cfg := &config.Config{Verification: config.VerificationConfig{Enabled: &tr}}
 	assert.True(t, cfg.VerificationEnabled())
+}
+
+func TestAgentTraceDefaults(t *testing.T) {
+	cfg := (&config.Config{}).EffectiveAgentTraces()
+	require.NotNil(t, cfg.Enabled)
+	assert.True(t, *cfg.Enabled)
+	assert.Equal(t, "final-only", cfg.CaptureAssistantText)
+	assert.Equal(t, "sanitized", cfg.CaptureToolArguments)
+	assert.Equal(t, "bounded", cfg.CaptureToolOutput)
+	assert.Equal(t, 16*1024, cfg.OutputLimit)
+	assert.Equal(t, 30, cfg.RetentionDays)
+}
+
+func TestWorkflowEvaluatorDefaults(t *testing.T) {
+	cfg := &config.Config{}
+	assert.Equal(t, 20, cfg.EvaluatorMaxTurns())
+	assert.Equal(t, "suggest", cfg.EvaluatorOnError())
+}
+
+func TestValidateWorkflowAndObservability(t *testing.T) {
+	tests := []config.Config{
+		{Workflow: config.WorkflowConfig{Evaluator: config.EvaluatorWorkflowConfig{MaxTurns: 51}}},
+		{Workflow: config.WorkflowConfig{Evaluator: config.EvaluatorWorkflowConfig{OnError: "approve"}}},
+		{Observability: config.ObservabilityConfig{AgentTraces: config.AgentTraceConfig{CaptureAssistantText: "thoughts"}}},
+		{Observability: config.ObservabilityConfig{AgentTraces: config.AgentTraceConfig{OutputLimit: 65 * 1024}}},
+		{Observability: config.ObservabilityConfig{AgentTraces: config.AgentTraceConfig{RetentionDays: 366}}},
+	}
+	for _, cfg := range tests {
+		assert.Error(t, cfg.ValidateWorkflowAndObservability())
+	}
+	assert.NoError(t, (&config.Config{}).ValidateWorkflowAndObservability())
+}
+
+func TestValidateAutonomyRejectsUnknownLevel(t *testing.T) {
+	cfg := &config.Config{Autonomy: config.AutonomyPolicy{BugFixes: "ship-it"}}
+	err := cfg.ValidateAutonomy()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "autonomy.bug_fixes")
 }
 
 func TestLoad_VerificationCommandsAndDefaults(t *testing.T) {

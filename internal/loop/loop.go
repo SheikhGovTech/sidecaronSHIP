@@ -7,8 +7,10 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sausheong/harness/llm"
 	"github.com/sausheong/harness/providers/anthropic"
@@ -19,6 +21,7 @@ import (
 	"github.com/sausheong/harness/tools/bash"
 	"github.com/sausheong/harness/tools/file"
 	"github.com/sausheong/sidecar/internal/adapter"
+	"github.com/sausheong/sidecar/internal/agenttrace"
 	"github.com/sausheong/sidecar/internal/config"
 	"github.com/sausheong/sidecar/internal/evaluate"
 	"github.com/sausheong/sidecar/internal/memory"
@@ -32,13 +35,14 @@ import (
 
 // Task status constants.
 const (
-	StatusPending   = "pending"
-	StatusRunning   = "running"
-	StatusCompleted = "completed"
-	StatusFailed    = "failed"
-	StatusSkipped   = "skipped"   // triage decided no action needed
-	StatusSuggested = "suggested" // suggest-only output, no code committed
-	StatusNotified  = "notified"  // notify autonomy level — notifications sent, no agent run
+	StatusPending     = "pending"
+	StatusRunning     = "running"
+	StatusCompleted   = "completed"
+	StatusFailed      = "failed"
+	StatusSkipped     = "skipped"      // triage decided no action needed
+	StatusSuggested   = "suggested"    // suggest-only output, no code committed
+	StatusNotified    = "notified"     // notify autonomy level — notifications sent, no agent run
+	StatusNeedsReview = "needs_review" // draft change request requires human review
 )
 
 // Models holds the resolved model names for each agent role.
@@ -212,6 +216,12 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 	if err := l.db.CreateTask(ctx, task); err != nil {
 		return fmt.Errorf("creating task: %w", err)
 	}
+	traceCfg := l.cfg.EffectiveAgentTraces()
+	if traceCfg.RetentionDays > 0 {
+		if _, err := l.db.DeleteAgentTraceEventsBefore(ctx, l.workspace.ID, time.Now().UTC().AddDate(0, 0, -traceCfg.RetentionDays), 1000); err != nil {
+			slog.Warn("agent trace retention cleanup failed", "err", err)
+		}
+	}
 
 	// ── Budget gate ──────────────────────────────────────────────────────────
 	// Checked before any LLM spend. Fails OPEN: a metering error allows the run
@@ -257,6 +267,12 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusSkipped)
 		l.dispatcher.Fire(ctx, notify.EventSkipped, sig, task)
 		return nil
+	}
+	if !config.ValidAutonomyLevel(tr.AutonomyLevel) {
+		_ = l.db.AppendTaskEvent(ctx, task.ID, "invalid_autonomy", map[string]any{"level": tr.AutonomyLevel})
+		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
+		l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
+		return fmt.Errorf("invalid autonomy level %q", tr.AutonomyLevel)
 	}
 
 	// ── Notify-only autonomy ─────────────────────────────────────────────────
@@ -390,7 +406,9 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 	}
 	defer rt.Close()
 
-	events, err := rt.Run(ctx, userMessage(sig), nil)
+	agentCtx, cancelAgent := context.WithCancel(ctx)
+	defer cancelAgent()
+	events, err := rt.Run(agentCtx, userMessage(sig), nil)
 	if err != nil {
 		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
 		l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
@@ -398,10 +416,17 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		return err
 	}
 
-	var agentErr error
+	codingTrace := agenttrace.New(l.db, task.ID, "coding", 1, workDir, traceCfg, l.traceSecrets()...)
+	var agentErr, traceErr error
 	var textBuf strings.Builder
 	var codingUsage UsageTotals
 	for ev := range events {
+		if traceErr == nil {
+			traceErr = codingTrace.Handle(ctx, ev)
+			if traceErr != nil {
+				cancelAgent()
+			}
+		}
 		if ev.Type == runtime.EventError {
 			agentErr = ev.Error
 		}
@@ -410,11 +435,23 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		}
 		AccumulateUsage(&codingUsage, ev)
 	}
-	if codingUsage.Total() > 0 {
+	codingEvidence := codingTrace.Summary()
+	safeCodingSummary := codingEvidence.Text
+	if safeCodingSummary == "" {
+		safeCodingSummary = boundEvidence(agenttrace.Redact(textBuf.String(), l.traceSecrets()...), 32*1024)
+	}
+	if codingEvidence.Requests == 0 && codingUsage.Total() > 0 {
 		_ = l.db.AppendTaskEvent(ctx, task.ID, "usage", map[string]any{
 			"input": codingUsage.Input, "output": codingUsage.Output,
 			"total": codingUsage.Total(), "model": models.Coding, "role": "coding",
 		})
+	}
+	if traceErr != nil {
+		_ = l.db.AppendTaskEvent(ctx, task.ID, "trace_persistence_failed", map[string]any{"role": "coding", "error": traceErr.Error()})
+		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
+		l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
+		l.discardWorktree(task.ID.String(), wt, &wtCleanup)
+		return fmt.Errorf("persisting coding-agent trace: %w", traceErr)
 	}
 	if agentErr != nil {
 		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
@@ -422,6 +459,12 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		l.discardWorktree(task.ID.String(), wt, &wtCleanup)
 		return fmt.Errorf("agent error: %w", agentErr)
 	}
+
+	var evaluatorEvidence agenttrace.Summary
+	var verificationEvidence []verification.Result
+	evaluationStatus := "not_run"
+	evaluationReasons := ""
+	draftChangeRequest := false
 
 	// ── Deterministic verification and adversarial evaluation gates ─────────
 	if ShipsCode(tr.AutonomyLevel) && l.cfg.VerificationEnabled() {
@@ -445,15 +488,20 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 				if result.Err != nil || result.ExitCode != 0 {
 					return l.failVerification(ctx, sig, task, wt, &wtCleanup, command.Name, result)
 				}
+				verificationEvidence = append(verificationEvidence, result)
 				_ = l.db.AppendTaskEvent(ctx, task.ID, "verification_succeeded", verificationEvent(result))
 			}
 
-			verdict, evalUsage, evalErr := evaluate.EvaluateWithCommands(ctx, l.provider, models.Evaluator, workDir, baseRef, task.Summary, verificationCommands)
+			evaluatorTrace := agenttrace.New(l.db, task.ID, "evaluator", 1, workDir, traceCfg, l.traceSecrets()...)
+			verdict, evalUsage, evalErr := evaluate.EvaluateObserved(ctx, l.provider, models.Evaluator, workDir, baseRef,
+				task.Summary, verificationCommands, l.cfg.EvaluatorMaxTurns(), evaluatorTrace.Handle)
+			evaluatorEvidence = evaluatorTrace.Summary()
+			safeEvalErr := ""
 			if evalErr != nil {
-				slog.Warn("evaluator error; failing closed (downgrade to suggestion)", "err", evalErr, "task", task.ID)
+				safeEvalErr = agenttrace.Redact(evalErr.Error(), l.traceSecrets()...)
 			}
 			// Record evaluator token spend even on error — the tokens were consumed.
-			if evalUsage.InputTokens+evalUsage.OutputTokens > 0 {
+			if evaluatorEvidence.Requests == 0 && evalUsage.InputTokens+evalUsage.OutputTokens > 0 {
 				_ = l.db.AppendTaskEvent(ctx, task.ID, "usage", map[string]any{
 					"input":  evalUsage.InputTokens,
 					"output": evalUsage.OutputTokens,
@@ -462,22 +510,47 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 					"role":   "evaluator",
 				})
 			}
-			_ = l.db.AppendTaskEvent(ctx, task.ID, "evaluation", map[string]any{
-				"pass":    verdict.Pass,
-				"reasons": verdict.Reasons,
-				"model":   models.Evaluator,
-				"error":   errString(evalErr),
-			})
-			if !GateAllowsCommit(verdict, evalErr) {
+			evaluationPayload := map[string]any{
+				"pass":     verdict.Pass,
+				"reasons":  verdict.Reasons,
+				"model":    models.Evaluator,
+				"error":    safeEvalErr,
+				"trace_id": evaluatorEvidence.TraceID.String(),
+			}
+			_ = l.db.AppendTaskEvent(ctx, task.ID, "evaluation", evaluationPayload)
+			if evalErr != nil {
+				evaluationStatus, evaluationReasons = "error", safeEvalErr
+				_ = l.db.AppendTaskEvent(ctx, task.ID, "evaluation_error", evaluationPayload)
+				slog.Warn("evaluator runtime error", "err", evalErr, "task", task.ID)
+				if l.cfg.EvaluatorOnError() == "draft-change-request" && tr.AutonomyLevel == "pull-request" {
+					draftChangeRequest = true
+				} else if l.cfg.EvaluatorOnError() == "fail" {
+					_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
+					l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
+					l.discardWorktree(task.ID.String(), wt, &wtCleanup)
+					return fmt.Errorf("evaluator: %w", evalErr)
+				} else {
+					_ = l.db.AppendTaskEvent(ctx, task.ID, "suggestion", map[string]any{"summary": safeCodingSummary, "evaluation_error": safeEvalErr})
+					_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusSuggested)
+					l.dispatcher.Fire(ctx, notify.EventSuggested, sig, task)
+					l.discardWorktree(task.ID.String(), wt, &wtCleanup)
+					return nil
+				}
+			} else if !verdict.Pass {
+				evaluationStatus, evaluationReasons = "reject", verdict.Reasons
+				_ = l.db.AppendTaskEvent(ctx, task.ID, "evaluation_rejected", evaluationPayload)
 				slog.Info("evaluator rejected change; recording as suggestion", "task", task.ID, "reasons", verdict.Reasons)
 				_ = l.db.AppendTaskEvent(ctx, task.ID, "suggestion", map[string]any{
-					"summary":          textBuf.String(),
+					"summary":          safeCodingSummary,
 					"rejected_reasons": verdict.Reasons,
 				})
 				_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusSuggested)
 				l.dispatcher.Fire(ctx, notify.EventSuggested, sig, task)
 				l.discardWorktree(task.ID.String(), wt, &wtCleanup)
 				return nil
+			} else {
+				evaluationStatus, evaluationReasons = "pass", verdict.Reasons
+				_ = l.db.AppendTaskEvent(ctx, task.ID, "evaluation_passed", evaluationPayload)
 			}
 		}
 	}
@@ -505,7 +578,7 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 	// ── Output routing ───────────────────────────────────────────────────────
 	switch tr.AutonomyLevel {
 	case "suggest-only":
-		summary := textBuf.String()
+		summary := safeCodingSummary
 		_ = l.db.AppendTaskEvent(ctx, task.ID, "suggestion", map[string]any{"summary": summary})
 		slog.Info("sidecar suggestion recorded", "task", task.ID, "change_type", tr.ChangeType)
 		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusSuggested)
@@ -531,11 +604,17 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		if resolveErr != nil {
 			return l.failDelivery(ctx, sig, task, branch, output.DeliveryTarget{Provider: l.cfg.Delivery.Provider}, output.PublishResult{}, resolveErr)
 		}
+		labels := []string(nil)
+		if draftChangeRequest {
+			labels = []string{"sidecar:evaluation-error"}
+		}
 		result, publishErr := output.NewPublisher(target).Publish(ctx, output.PublishRequest{
 			RepoPath: l.repoPath,
 			Branch:   branch,
 			Title:    "sidecar: " + task.Summary,
-			Body:     l.prBody(sig, tr, task.ID.String()),
+			Body:     l.prBody(sig, tr, task.ID.String(), codingEvidence, evaluatorEvidence, verificationEvidence, evaluationStatus, evaluationReasons),
+			Draft:    draftChangeRequest,
+			Labels:   labels,
 		})
 		if result.Pushed {
 			_ = l.db.AppendTaskEvent(ctx, task.ID, "branch_pushed", map[string]any{
@@ -551,13 +630,18 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		}
 		_ = l.db.AppendTaskEvent(ctx, task.ID, eventType, map[string]any{
 			"provider": target.Provider, "url": result.URL, "branch": branch, "base_branch": target.BaseBranch,
+			"draft": draftChangeRequest, "evaluation_status": evaluationStatus,
 		})
 		slog.Info("sidecar change request ready", "provider", target.Provider, "url", result.URL, "task", task.ID)
-		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusCompleted)
+		status := StatusCompleted
+		if draftChangeRequest {
+			status = StatusNeedsReview
+		}
+		_ = l.db.UpdateTaskStatus(ctx, task.ID, status)
 		l.dispatcher.Fire(ctx, notify.EventCompleted, sig, task)
 		return nil
 
-	default: // "auto-commit"
+	case "auto-commit":
 		branch, err := commit()
 		if err != nil {
 			_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
@@ -572,6 +656,13 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusCompleted)
 		l.dispatcher.Fire(ctx, notify.EventCompleted, sig, task)
 		return nil
+
+	default:
+		_ = l.db.AppendTaskEvent(ctx, task.ID, "invalid_autonomy", map[string]any{"level": tr.AutonomyLevel})
+		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
+		l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
+		l.discardWorktree(task.ID.String(), wt, &wtCleanup)
+		return fmt.Errorf("invalid autonomy level %q", tr.AutonomyLevel)
 	}
 }
 
@@ -699,10 +790,92 @@ func (l *Loop) resolveRepoAndToken(sig adapter.Signal) (repo, token string) {
 	return
 }
 
-// prBody generates the PR description.
-func (l *Loop) prBody(sig adapter.Signal, tr triage.TriageResult, taskID string) string {
-	return fmt.Sprintf("## Sidecar automated fix\n\n**Signal:** %s — %s\n**Change type:** %s\n**Task ID:** %s\n\nThis PR was created automatically by Sidecar. Review and merge if the fix looks correct.",
-		string(sig.Type), summarize(sig), tr.ChangeType, taskID)
+// prBody generates a bounded decision record. It references durable traces
+// rather than copying complete prompts, CI logs, or hidden model reasoning.
+func (l *Loop) prBody(sig adapter.Signal, tr triage.TriageResult, taskID string, coding, evaluator agenttrace.Summary, checks []verification.Result, evaluationStatus, evaluationReasons string) string {
+	var body strings.Builder
+	fmt.Fprintf(&body, "## Sidecar automated fix\n\n**Signal:** %s — %s\n**Change type:** %s\n**Task ID:** `%s`\n\n", string(sig.Type), summarize(sig), tr.ChangeType, taskID)
+	fmt.Fprintf(&body, "## Decision log\n\n- Triage: `%s` (%s)\n- Autonomy: `%s`\n- Evaluator: `%s`", tr.ChangeType, tr.Reason, tr.AutonomyLevel, evaluationStatus)
+	if evaluationReasons != "" {
+		fmt.Fprintf(&body, " — %s", evaluationReasons)
+	}
+	body.WriteString("\n\n## Repair agent record\n\n")
+	if coding.Enabled {
+		fmt.Fprintf(&body, "- Trace: `%s`\n", coding.TraceID)
+	} else {
+		body.WriteString("- Trace: disabled by configuration\n")
+	}
+	fmt.Fprintf(&body, "- Model requests: %d\n- Tokens: %d input / %d output\n- Tool calls: %d\n", coding.Requests, coding.InputTokens, coding.OutputTokens, coding.ToolCalls)
+	if repeated := repeatedToolEvidence(coding.RepeatedTools); len(repeated) > 0 {
+		fmt.Fprintf(&body, "- Repeated tool calls: %s\n", strings.Join(repeated, ", "))
+	}
+	if coding.Text != "" {
+		text := coding.Text
+		if len(text) > 4096 {
+			text = text[:4096] + "\n[TRUNCATED]"
+		}
+		fmt.Fprintf(&body, "\n<details><summary>Visible final agent message</summary>\n\n%s\n\n</details>\n", text)
+	}
+	body.WriteString("\n## Verification record\n\n")
+	if len(checks) == 0 {
+		body.WriteString("- No configured deterministic command was run.\n")
+	}
+	for _, check := range checks {
+		fmt.Fprintf(&body, "- `%s`: exit %d in %s (output truncated: %t)\n", check.Name, check.ExitCode, check.Duration.Round(time.Millisecond), check.Truncated)
+	}
+	body.WriteString("\n## Evaluator record\n\n")
+	if evaluator.Enabled {
+		fmt.Fprintf(&body, "- Trace: `%s`\n- Outcome: `%s`\n- Model requests: %d / max turns %d\n- Tokens: %d input / %d output\n- Tool calls: %d\n", evaluator.TraceID, evaluationStatus, evaluator.Requests, l.cfg.EvaluatorMaxTurns(), evaluator.InputTokens, evaluator.OutputTokens, evaluator.ToolCalls)
+		if evaluator.PersistenceFail != nil {
+			body.WriteString("- Audit evidence: incomplete because durable trace persistence failed\n")
+		}
+	} else {
+		fmt.Fprintf(&body, "- Outcome: `%s`\n- Trace: not available\n", evaluationStatus)
+	}
+	if evaluationStatus == "error" {
+		body.WriteString("\n> **Human review required:** deterministic verification passed, but evaluator execution did not complete. This change request is not evaluator-approved.\n")
+	}
+	if evaluator.Text != "" {
+		text := evaluator.Text
+		if len(text) > 4096 {
+			text = text[:4096] + "\n[TRUNCATED]"
+		}
+		fmt.Fprintf(&body, "\n<details><summary>Visible evaluator message</summary>\n\n%s\n\n</details>\n", text)
+	}
+	body.WriteString("\nThis change request contains sanitized, bounded evidence. When tracing is enabled, full permitted trace records remain in Sidecar's task database.\n")
+	return boundEvidence(agenttrace.Redact(body.String(), l.traceSecrets()...), 32*1024)
+}
+
+func repeatedToolEvidence(repeats map[string]int) []string {
+	var result []string
+	for toolHash, count := range repeats {
+		if count > 1 {
+			name := strings.SplitN(toolHash, ":", 2)[0]
+			result = append(result, fmt.Sprintf("`%s` × %d", name, count))
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+func boundEvidence(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	const marker = "\n\n[SIDECAR EVIDENCE TRUNCATED]\n"
+	value = value[:limit-len(marker)]
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value + marker
+}
+
+func (l *Loop) traceSecrets() []string {
+	secrets := []string{l.cfg.Delivery.ResolveToken(), os.Getenv("ANTHROPIC_API_KEY"), os.Getenv("PAI_TOKEN"), os.Getenv("DATABASE_URL"), os.Getenv("SIDECAR_TEST_DB_URL")}
+	for _, signal := range l.cfg.Signals {
+		secrets = append(secrets, signal.ResolveToken())
+	}
+	return secrets
 }
 
 // BuildSystemPrompt constructs the signal-specific prompt without runtime

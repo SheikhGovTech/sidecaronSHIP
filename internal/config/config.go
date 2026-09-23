@@ -24,6 +24,111 @@ type Config struct {
 	Skills        SkillsConfig         `yaml:"skills"`
 	Budget        BudgetConfig         `yaml:"budget"`
 	Delivery      DeliveryConfig       `yaml:"delivery"`
+	Observability ObservabilityConfig  `yaml:"observability"`
+	Workflow      WorkflowConfig       `yaml:"workflow"`
+}
+
+type WorkflowConfig struct {
+	Evaluator EvaluatorWorkflowConfig `yaml:"evaluator"`
+}
+
+type EvaluatorWorkflowConfig struct {
+	MaxTurns int    `yaml:"max_turns"`
+	OnError  string `yaml:"on_error"`
+}
+
+const (
+	DefaultEvaluatorMaxTurns = 20
+	MaxEvaluatorMaxTurns     = 50
+)
+
+func (c *Config) EvaluatorMaxTurns() int {
+	if c.Workflow.Evaluator.MaxTurns == 0 {
+		return DefaultEvaluatorMaxTurns
+	}
+	return c.Workflow.Evaluator.MaxTurns
+}
+
+func (c *Config) EvaluatorOnError() string {
+	if c.Workflow.Evaluator.OnError == "" {
+		return "suggest"
+	}
+	return c.Workflow.Evaluator.OnError
+}
+
+type ObservabilityConfig struct {
+	AgentTraces AgentTraceConfig `yaml:"agent_traces"`
+}
+
+type AgentTraceConfig struct {
+	Enabled              *bool  `yaml:"enabled"`
+	CaptureAssistantText string `yaml:"capture_assistant_text"`
+	CaptureToolArguments string `yaml:"capture_tool_arguments"`
+	CaptureToolOutput    string `yaml:"capture_tool_output"`
+	OutputLimit          int    `yaml:"output_limit"`
+	RetentionDays        int    `yaml:"retention_days"`
+	LogToolActivity      *bool  `yaml:"log_tool_activity"`
+}
+
+const (
+	DefaultAgentTraceOutputLimit   = 16 * 1024
+	MaxAgentTraceOutputLimit       = 64 * 1024
+	DefaultAgentTraceRetentionDays = 30
+	MaxAgentTraceRetentionDays     = 365
+)
+
+func (c *Config) EffectiveAgentTraces() AgentTraceConfig {
+	cfg := c.Observability.AgentTraces
+	if cfg.Enabled == nil {
+		value := true
+		cfg.Enabled = &value
+	}
+	if cfg.CaptureAssistantText == "" {
+		cfg.CaptureAssistantText = "final-only"
+	}
+	if cfg.CaptureToolArguments == "" {
+		cfg.CaptureToolArguments = "sanitized"
+	}
+	if cfg.CaptureToolOutput == "" {
+		cfg.CaptureToolOutput = "bounded"
+	}
+	if cfg.OutputLimit == 0 {
+		cfg.OutputLimit = DefaultAgentTraceOutputLimit
+	}
+	if cfg.RetentionDays == 0 {
+		cfg.RetentionDays = DefaultAgentTraceRetentionDays
+	}
+	if cfg.LogToolActivity == nil {
+		value := true
+		cfg.LogToolActivity = &value
+	}
+	return cfg
+}
+
+func (c *Config) ValidateWorkflowAndObservability() error {
+	if turns := c.Workflow.Evaluator.MaxTurns; turns < 0 || turns > MaxEvaluatorMaxTurns {
+		return fmt.Errorf("workflow.evaluator.max_turns must be between 1 and %d when set", MaxEvaluatorMaxTurns)
+	}
+	if action := c.Workflow.Evaluator.OnError; action != "" && action != "suggest" && action != "fail" && action != "draft-change-request" {
+		return fmt.Errorf("workflow.evaluator.on_error must be suggest, fail, or draft-change-request")
+	}
+	traces := c.EffectiveAgentTraces()
+	if traces.CaptureAssistantText != "none" && traces.CaptureAssistantText != "final-only" && traces.CaptureAssistantText != "all-visible" {
+		return fmt.Errorf("observability.agent_traces.capture_assistant_text is invalid")
+	}
+	if traces.CaptureToolArguments != "none" && traces.CaptureToolArguments != "sanitized" {
+		return fmt.Errorf("observability.agent_traces.capture_tool_arguments is invalid")
+	}
+	if traces.CaptureToolOutput != "none" && traces.CaptureToolOutput != "metadata" && traces.CaptureToolOutput != "bounded" {
+		return fmt.Errorf("observability.agent_traces.capture_tool_output is invalid")
+	}
+	if traces.OutputLimit <= 0 || traces.OutputLimit > MaxAgentTraceOutputLimit {
+		return fmt.Errorf("observability.agent_traces.output_limit must be between 1 and %d bytes", MaxAgentTraceOutputLimit)
+	}
+	if traces.RetentionDays < 1 || traces.RetentionDays > MaxAgentTraceRetentionDays {
+		return fmt.Errorf("observability.agent_traces.retention_days must be between 1 and %d", MaxAgentTraceRetentionDays)
+	}
+	return nil
 }
 
 // DeliveryConfig controls where approved pull-request changes are published.
@@ -378,9 +483,22 @@ func ValidAutonomyLevel(s string) bool {
 	return validAutonomyLevels[s]
 }
 
-// Load reads, parses, and validates security-sensitive verification settings.
-// Other field values remain permissive; callers that need to validate autonomy
-// levels must call ValidAutonomyLevel separately.
+func (c *Config) ValidateAutonomy() error {
+	levels := map[string]string{
+		"dependency_updates": c.Autonomy.DependencyUpdates, "test_fixes": c.Autonomy.TestFixes,
+		"bug_fixes": c.Autonomy.BugFixes, "refactoring": c.Autonomy.Refactoring,
+		"schema_changes": c.Autonomy.SchemaChanges, "log_fixes": c.Autonomy.LogFixes,
+		"metric_fixes": c.Autonomy.MetricFixes, "uptime_fixes": c.Autonomy.UptimeFixes,
+	}
+	for field, level := range levels {
+		if level != "" && !ValidAutonomyLevel(level) {
+			return fmt.Errorf("autonomy.%s has invalid level %q", field, level)
+		}
+	}
+	return nil
+}
+
+// Load reads, parses, and validates configuration.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -393,7 +511,13 @@ func Load(path string) (*Config, error) {
 	if err := cfg.ValidateVerification(); err != nil {
 		return nil, fmt.Errorf("validating config %q: %w", path, err)
 	}
+	if err := cfg.ValidateAutonomy(); err != nil {
+		return nil, fmt.Errorf("validating config %q: %w", path, err)
+	}
 	if err := cfg.Delivery.Validate(); err != nil {
+		return nil, fmt.Errorf("validating config %q: %w", path, err)
+	}
+	if err := cfg.ValidateWorkflowAndObservability(); err != nil {
 		return nil, fmt.Errorf("validating config %q: %w", path, err)
 	}
 	return &cfg, nil

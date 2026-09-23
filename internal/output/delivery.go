@@ -34,6 +34,8 @@ type PublishRequest struct {
 	Branch   string
 	Title    string
 	Body     string
+	Draft    bool
+	Labels   []string
 }
 
 type PublishResult struct {
@@ -258,9 +260,10 @@ func (p *gitHubPublisher) Publish(ctx context.Context, req PublishRequest) (Publ
 		result.URL, result.Reused = existing[0].HTMLURL, true
 		return result, nil
 	}
-	body := map[string]string{"title": req.Title, "body": req.Body, "head": req.Branch, "base": p.target.BaseBranch}
+	body := map[string]any{"title": req.Title, "body": req.Body, "head": req.Branch, "base": p.target.BaseBranch, "draft": req.Draft}
 	var created struct {
 		HTMLURL string `json:"html_url"`
+		Number  int    `json:"number"`
 	}
 	if err := p.api(ctx, http.MethodPost, fmt.Sprintf("%s/repos/%s/pulls", p.target.APIBaseURL, p.target.Repo), body, &created); err != nil {
 		return result, &DeliveryError{Phase: "create", Err: err}
@@ -268,6 +271,13 @@ func (p *gitHubPublisher) Publish(ctx context.Context, req PublishRequest) (Publ
 	result.URL = created.HTMLURL
 	if result.URL == "" {
 		return result, &DeliveryError{Phase: "create", Err: fmt.Errorf("provider returned an empty pull-request URL")}
+	}
+	if len(req.Labels) > 0 && created.Number > 0 {
+		labelsEndpoint := fmt.Sprintf("%s/repos/%s/issues/%d/labels", p.target.APIBaseURL, p.target.Repo, created.Number)
+		var labelsResult any
+		if err := p.api(ctx, http.MethodPost, labelsEndpoint, map[string]any{"labels": req.Labels}, &labelsResult); err != nil {
+			return result, &DeliveryError{Phase: "label", Err: err}
+		}
 	}
 	return result, nil
 }
@@ -297,7 +307,14 @@ func (p *gitLabPublisher) Publish(ctx context.Context, req PublishRequest) (Publ
 		result.URL, result.Reused = existing[0].WebURL, true
 		return result, nil
 	}
-	body := map[string]string{"title": req.Title, "description": req.Body, "source_branch": req.Branch, "target_branch": p.target.BaseBranch}
+	title := req.Title
+	if req.Draft && !strings.HasPrefix(strings.ToLower(title), "draft:") {
+		title = "Draft: " + title
+	}
+	body := map[string]string{"title": title, "description": req.Body, "source_branch": req.Branch, "target_branch": p.target.BaseBranch}
+	if len(req.Labels) > 0 {
+		body["labels"] = strings.Join(req.Labels, ",")
+	}
 	var created struct {
 		WebURL string `json:"web_url"`
 	}

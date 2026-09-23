@@ -34,6 +34,23 @@ verification:
   #     working_directory: .
   #     pass_env: [PATH, HOME]
 
+workflow:
+  evaluator:
+    max_turns: 20       # default 20; maximum 50
+    # suggest (default), fail, or draft-change-request. The draft option is
+    # available for pull-request autonomy and never represents evaluator PASS.
+    on_error: suggest
+
+observability:
+  agent_traces:
+    enabled: true
+    capture_assistant_text: final-only # none | final-only | all-visible
+    capture_tool_arguments: sanitized  # none | sanitized
+    capture_tool_output: bounded       # none | metadata | bounded
+    output_limit: 16384                 # bytes; maximum 65536
+    retention_days: 30                  # 1–365
+    log_tool_activity: true
+
 # Provider-aware pull-request delivery. Configure this on repositories using
 # pull-request autonomy; GitLab creates an MR and GitHub creates a PR.
 # delivery:

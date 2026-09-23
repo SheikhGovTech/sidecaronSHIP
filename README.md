@@ -119,7 +119,9 @@ Before any code ships (`auto-commit` or `pull-request`), an **adversarial evalua
 {"pass": false, "reasons": "tests still fail: TestCreate expects 201, got 200"}
 ```
 
-On **REJECT**, the change does not ship — it is recorded as a suggestion with the evaluator's reasons. The gate **fails closed**: if the evaluator errors or returns unparseable output, the change is treated as rejected, never silently committed. Verification is enabled by default (`verification.enabled: true`) and applies to both `auto-commit` and `pull-request`. Setting it to `false` disables both configured commands and the evaluator. `suggest-only`, `notify`, and unchanged tasks skip commands.
+On **REJECT**, the change does not ship — it is recorded as a suggestion with the evaluator's reasons. An evaluator runtime failure is recorded separately as **ERROR**, never as a rejection or approval. The default error policy is `suggest`; `fail` marks the task failed, while `draft-change-request` may preserve a deterministically verified `pull-request` repair as a human-gated draft labelled `sidecar:evaluation-error`. Verification is enabled by default (`verification.enabled: true`) and applies to both `auto-commit` and `pull-request`. Setting it to `false` disables both configured commands and the evaluator. `suggest-only`, `notify`, and unchanged tasks skip commands.
+
+Sidecar persists sanitized Harness action traces for the coding agent and evaluator. Traces contain visible assistant output, bounded tool evidence, request-level usage, and terminal outcomes—not hidden chain-of-thought, complete prompts, file bodies, or raw unbounded logs. Request usage is recorded before error policy and worktree cleanup, so evaluator spend remains visible when a run exhausts its turn limit. Generated PRs/MRs include a bounded decision summary and durable trace IDs.
 
 ### 6. Output routing
 
@@ -562,6 +564,26 @@ verification:
       timeout: 10m          # default 10m; maximum 30m
       working_directory: . # relative to the task worktree
       pass_env: [PATH, HOME]
+
+# Evaluator execution policy. A draft created after ERROR is explicitly
+# unapproved and requires human review; a valid REJECT still becomes a
+# suggestion.
+workflow:
+  evaluator:
+    max_turns: 20       # default 20; maximum 50
+    on_error: suggest   # suggest | fail | draft-change-request
+
+# Durable, sanitized Harness event traces. Provider request usage remains
+# metered even when detailed trace capture is disabled.
+observability:
+  agent_traces:
+    enabled: true
+    capture_assistant_text: final-only # none | final-only | all-visible
+    capture_tool_arguments: sanitized  # none | sanitized
+    capture_tool_output: bounded       # none | metadata | bounded
+    output_limit: 16384                 # bytes; maximum 65536
+    retention_days: 30                  # 1–365
+    log_tool_activity: true
 
 # GitHub repositories use the same delivery contract:
 # delivery:

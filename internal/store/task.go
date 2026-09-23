@@ -107,12 +107,24 @@ func (db *DB) AppendTaskEvent(ctx context.Context, taskID uuid.UUID, eventType s
 // budget cap. Returns 0 when there are no matching events.
 func (db *DB) SumWorkspaceTokensSince(ctx context.Context, workspaceID uuid.UUID, since time.Time) (int, error) {
 	const q = `
-		SELECT COALESCE(SUM((te.payload->>'total')::bigint), 0)
-		FROM task_events te
-		JOIN tasks t ON t.id = te.task_id
-		WHERE t.workspace_id = $1
-		  AND te.type = 'usage'
-		  AND te.created_at >= $2`
+		SELECT
+			COALESCE((
+				SELECT SUM((te.payload->>'total')::bigint)
+				FROM task_events te
+				JOIN tasks t ON t.id = te.task_id
+				WHERE t.workspace_id = $1
+				  AND te.type = 'usage'
+				  AND te.created_at >= $2
+			), 0)
+			+
+			COALESCE((
+				SELECT SUM(COALESCE(aru.input_tokens, 0) + COALESCE(aru.output_tokens, 0))
+				FROM agent_request_usage aru
+				JOIN tasks t ON t.id = aru.task_id
+				WHERE t.workspace_id = $1
+				  AND aru.source = 'reported'
+				  AND aru.created_at >= $2
+			), 0)`
 	var sum int64
 	if err := db.pool.QueryRow(ctx, q, workspaceID, since).Scan(&sum); err != nil {
 		return 0, fmt.Errorf("summing workspace tokens: %w", err)

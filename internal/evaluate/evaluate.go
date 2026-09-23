@@ -133,8 +133,23 @@ func Evaluate(ctx context.Context, provider llm.LLMProvider, model, workDir, bas
 // EvaluateWithCommands evaluates the diff and gives the skeptic the same
 // workspace and required verification contract as the coding agent.
 func EvaluateWithCommands(ctx context.Context, provider llm.LLMProvider, model, workDir, baseRef, taskSummary string, commands []config.VerificationCommand) (Verdict, llm.Usage, error) {
+	return EvaluateObserved(ctx, provider, model, workDir, baseRef, taskSummary, commands, 20, nil)
+}
+
+// EventObserver receives every evaluator runtime event before EvaluateObserved
+// acts on it. Observers should durably persist the event and return an error if
+// that persistence fails.
+type EventObserver func(context.Context, runtime.AgentEvent) error
+
+// EvaluateObserved evaluates a change while exposing the complete runtime
+// event stream. It drains the stream after errors so request-level usage that
+// precedes a terminal error is not lost.
+func EvaluateObserved(ctx context.Context, provider llm.LLMProvider, model, workDir, baseRef, taskSummary string, commands []config.VerificationCommand, maxTurns int, observe EventObserver) (Verdict, llm.Usage, error) {
 	if baseRef == "" {
 		baseRef = "HEAD"
+	}
+	if maxTurns <= 0 {
+		maxTurns = 20
 	}
 	// Stage everything (including untracked files) so the index reflects exactly
 	// what CommitInPlaceFrom would commit.
@@ -168,7 +183,7 @@ func EvaluateWithCommands(ctx context.Context, provider llm.LLMProvider, model, 
 			Model:        model,
 			Workspace:    workDir,
 			SystemPrompt: SystemPromptWithContext(workDir, commands),
-			MaxTurns:     20,
+			MaxTurns:     maxTurns,
 		},
 	)
 	if err != nil {
@@ -176,29 +191,56 @@ func EvaluateWithCommands(ctx context.Context, provider llm.LLMProvider, model, 
 	}
 	defer rt.Close()
 
-	events, err := rt.Run(ctx, BuildEvalMessage(taskSummary, diff), nil)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	events, err := rt.Run(runCtx, BuildEvalMessage(taskSummary, diff), nil)
 	if err != nil {
 		return Verdict{}, llm.Usage{}, fmt.Errorf("running evaluator: %w", err)
 	}
 
 	var sb strings.Builder
 	var usage llm.Usage
+	var eventErr, observerErr error
+	requestUsageSeen := false
 	for ev := range events {
+		if observe != nil && observerErr == nil {
+			observerErr = observe(ctx, ev)
+			if observerErr != nil {
+				cancel()
+			}
+		}
 		if ev.Type == runtime.EventTextDelta {
 			sb.WriteString(ev.Text)
 		}
-		if ev.Type == runtime.EventDone && ev.Usage != nil {
+		if ev.Type == runtime.EventRequestUsage && ev.RequestUsage != nil {
+			requestUsageSeen = true
+			if ev.RequestUsage.Usage != nil {
+				usage.InputTokens += ev.RequestUsage.Usage.InputTokens
+				usage.OutputTokens += ev.RequestUsage.Usage.OutputTokens
+				usage.CacheCreationInputTokens += ev.RequestUsage.Usage.CacheCreationInputTokens
+				usage.CacheReadInputTokens += ev.RequestUsage.Usage.CacheReadInputTokens
+			}
+		}
+		if ev.Type == runtime.EventDone && ev.Usage != nil && !requestUsageSeen {
 			usage.InputTokens += ev.Usage.InputTokens
 			usage.OutputTokens += ev.Usage.OutputTokens
+			usage.CacheCreationInputTokens += ev.Usage.CacheCreationInputTokens
+			usage.CacheReadInputTokens += ev.Usage.CacheReadInputTokens
 		}
-		if ev.Type == runtime.EventError && ev.Error != nil {
-			return Verdict{}, llm.Usage{}, fmt.Errorf("evaluator event error: %w", ev.Error)
+		if ev.Type == runtime.EventError && ev.Error != nil && eventErr == nil {
+			eventErr = ev.Error
 		}
+	}
+	if observerErr != nil {
+		return Verdict{}, usage, fmt.Errorf("persisting evaluator trace: %w", observerErr)
+	}
+	if eventErr != nil {
+		return Verdict{}, usage, fmt.Errorf("evaluator event error: %w", eventErr)
 	}
 
 	verdict, err := ParseVerdict(sb.String())
 	if err != nil {
-		return Verdict{}, llm.Usage{}, err
+		return Verdict{}, usage, err
 	}
 	return verdict, usage, nil
 }

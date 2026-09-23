@@ -29,6 +29,48 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Sanitized, ordered runtime evidence emitted by Harness agent runs.
+CREATE TABLE IF NOT EXISTS agent_trace_events (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id      UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    trace_id     UUID NOT NULL,
+    role         TEXT NOT NULL,
+    attempt      INTEGER NOT NULL DEFAULT 1,
+    sequence     BIGINT NOT NULL,
+    event_type   TEXT NOT NULL,
+    tool_call_id TEXT,
+    tool_name    TEXT,
+    payload      JSONB NOT NULL DEFAULT '{}',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (trace_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS agent_trace_events_task_created_idx
+    ON agent_trace_events (task_id, created_at);
+CREATE INDEX IF NOT EXISTS agent_trace_events_created_idx
+    ON agent_trace_events (created_at);
+
+-- Provider attempts are the authoritative budget unit. request_id makes
+-- retries and terminal aggregate replay idempotent.
+CREATE TABLE IF NOT EXISTS agent_request_usage (
+    id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id                     UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    trace_id                    UUID NOT NULL,
+    request_id                  TEXT NOT NULL,
+    role                        TEXT NOT NULL,
+    model                       TEXT NOT NULL DEFAULT '',
+    category                    TEXT NOT NULL DEFAULT '',
+    status                      TEXT NOT NULL DEFAULT '',
+    source                      TEXT NOT NULL DEFAULT 'unavailable',
+    input_tokens                BIGINT,
+    output_tokens               BIGINT,
+    cache_creation_input_tokens BIGINT,
+    cache_read_input_tokens     BIGINT,
+    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (task_id, request_id)
+);
+CREATE INDEX IF NOT EXISTS agent_request_usage_task_created_idx
+    ON agent_request_usage (task_id, created_at);
+
 -- Requires pgvector extension (install with: CREATE EXTENSION IF NOT EXISTS vector)
 CREATE EXTENSION IF NOT EXISTS vector;
 

@@ -390,3 +390,42 @@ func TestSumWorkspaceTokensSince(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, sum)
 }
+
+func TestAgentTraceEventsAndIdempotentUsage(t *testing.T) {
+	db, err := store.Connect(context.Background(), dbURL(t))
+	require.NoError(t, err)
+	defer db.Close()
+	require.NoError(t, store.Migrate(context.Background(), db))
+
+	ctx := context.Background()
+	ws := &store.Workspace{Name: "trace", Path: t.TempDir(), ConfigHash: "h"}
+	require.NoError(t, db.UpsertWorkspace(ctx, ws))
+	task := &store.Task{WorkspaceID: ws.ID, SignalType: "ci.failure", Summary: "trace test"}
+	require.NoError(t, db.CreateTask(ctx, task))
+	traceID := uuid.New()
+	for sequence, eventType := range []string{"tool_call", "tool_result", "agent_error"} {
+		require.NoError(t, db.AppendAgentTraceEvent(ctx, &store.AgentTraceEvent{
+			TaskID: task.ID, TraceID: traceID, Role: "evaluator", Attempt: 1,
+			Sequence: int64(sequence + 1), EventType: eventType, Payload: map[string]any{"safe": true},
+		}))
+	}
+	events, err := db.ListAgentTraceEvents(ctx, task.ID, 10)
+	require.NoError(t, err)
+	require.Len(t, events, 3)
+	assert.Equal(t, int64(1), events[0].Sequence)
+	assert.Equal(t, "agent_error", events[2].EventType)
+
+	input, output := int64(100), int64(20)
+	usage := store.AgentRequestUsage{TaskID: task.ID, TraceID: traceID, RequestID: "provider-request-1",
+		Role: "evaluator", Model: "model", Status: "failed", Source: "reported", InputTokens: &input, OutputTokens: &output}
+	inserted, err := db.RecordAgentRequestUsage(ctx, usage)
+	require.NoError(t, err)
+	assert.True(t, inserted)
+	inserted, err = db.RecordAgentRequestUsage(ctx, usage)
+	require.NoError(t, err)
+	assert.False(t, inserted)
+
+	total, err := db.SumWorkspaceTokensSince(ctx, ws.ID, time.Now().Add(-time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, 120, total)
+}

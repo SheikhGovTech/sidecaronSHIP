@@ -2,6 +2,7 @@ package output_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -130,6 +131,65 @@ func TestGitHubPublisherCreatesPullRequest(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, result.Pushed)
 	assert.Equal(t, "https://github.example/group/project/pull/1", result.URL)
+}
+
+func TestGitHubPublisherCreatesDraftAndAppliesLabel(t *testing.T) {
+	repo, bare := deliveryRepo(t)
+	var draft bool
+	var labels []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`[]`))
+		case strings.HasSuffix(r.URL.Path, "/pulls"):
+			var body struct {
+				Draft bool `json:"draft"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			draft = body.Draft
+			_, _ = w.Write([]byte(`{"html_url":"https://github.example/pull/1","number":1}`))
+		case strings.HasSuffix(r.URL.Path, "/issues/1/labels"):
+			var body struct {
+				Labels []string `json:"labels"`
+			}
+			require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+			labels = body.Labels
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer server.Close()
+	target := output.DeliveryTarget{Provider: "github", Repo: "group/project", Remote: "origin", RemoteURL: bare, APIBaseURL: server.URL, BaseBranch: "main"}
+	_, err := output.NewPublisher(target).Publish(context.Background(), output.PublishRequest{
+		RepoPath: repo, Branch: "sidecar/task-1", Title: "fix", Draft: true, Labels: []string{"sidecar:evaluation-error"},
+	})
+	require.NoError(t, err)
+	assert.True(t, draft)
+	assert.Equal(t, []string{"sidecar:evaluation-error"}, labels)
+}
+
+func TestGitLabPublisherMarksDraftAndLabels(t *testing.T) {
+	repo, bare := deliveryRepo(t)
+	var title, labels string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		var body map[string]string
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+		title, labels = body["title"], body["labels"]
+		_, _ = w.Write([]byte(`{"web_url":"https://gitlab.example/mr/1"}`))
+	}))
+	defer server.Close()
+	target := output.DeliveryTarget{Provider: "gitlab", Repo: "group/project", Remote: "origin", RemoteURL: bare, APIBaseURL: server.URL, BaseBranch: "main"}
+	_, err := output.NewPublisher(target).Publish(context.Background(), output.PublishRequest{
+		RepoPath: repo, Branch: "sidecar/task-1", Title: "fix", Draft: true, Labels: []string{"sidecar:evaluation-error"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "Draft: fix", title)
+	assert.Equal(t, "sidecar:evaluation-error", labels)
 }
 
 func TestGitHubPublisherReusesPullRequest(t *testing.T) {
