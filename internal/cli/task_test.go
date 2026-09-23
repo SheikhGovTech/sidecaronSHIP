@@ -22,3 +22,18 @@ func TestTaskCmd_RequiresDBURL(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "SIDECAR_DB_URL")
 }
+
+func TestTaskShowValidatesIDBeforeDatabaseAccess(t *testing.T) {
+	root := cli.RootCmd()
+	root.SetArgs([]string{"task", "show", "not-a-uuid"})
+	err := root.Execute()
+	assert.ErrorContains(t, err, "invalid task ID")
+}
+
+func TestTaskShowRequiresDBURL(t *testing.T) {
+	t.Setenv("SIDECAR_DB_URL", "")
+	root := cli.RootCmd()
+	root.SetArgs([]string{"task", "show", "00000000-0000-0000-0000-000000000001"})
+	err := root.Execute()
+	assert.ErrorContains(t, err, "SIDECAR_DB_URL")
+}

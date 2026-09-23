@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sausheong/harness/llm"
 	"github.com/sausheong/harness/llm/llmtest"
@@ -63,10 +64,13 @@ func initRepo(t *testing.T) string {
 // recording (AccumulateUsage / SumWorkspaceTokensSince) is exercised.
 type scriptedProvider struct {
 	llmtest.Base
-	evalPass   bool // verdict returned for the evaluator turn
-	evalErr    bool // when true, the evaluator turn returns an error (fail-closed test)
-	noChange   bool // coding completes without writing a diff
-	selfCommit bool // coding creates and commits its own change
+	evalPass              bool // verdict returned for the evaluator turn
+	evalErr               bool // when true, the evaluator turn returns an error (fail-closed test)
+	evalMalformed         bool
+	noChange              bool // coding completes without writing a diff
+	codingIncomplete      bool
+	codingEmptyIncomplete bool
+	selfCommit            bool // coding creates and commits its own change
 }
 
 // systemText returns the effective system prompt for routing. The runtime
@@ -103,9 +107,12 @@ func (p *scriptedProvider) ChatStream(_ context.Context, req llm.ChatRequest) (<
 			ch := make(chan llm.ChatEvent, 1)
 			go func() {
 				defer close(ch)
-				ch <- llm.ChatEvent{Type: llm.EventError, Error: errEvaluator}
+				ch <- llm.ChatEvent{Type: llm.EventError, Error: errEvaluator, Usage: &llm.Usage{InputTokens: 40, OutputTokens: 10}}
 			}()
 			return ch, nil
+		}
+		if p.evalMalformed {
+			return emit("verification looks valid but no verdict was emitted"), nil
 		}
 		verdict := `{"pass": false, "reasons": "rejected by test"}`
 		if p.evalPass {
@@ -120,6 +127,23 @@ func (p *scriptedProvider) ChatStream(_ context.Context, req llm.ChatRequest) (<
 	}
 	if p.noChange {
 		return emit("no change required"), nil
+	}
+	if p.codingIncomplete {
+		ch := make(chan llm.ChatEvent, 2)
+		go func() {
+			defer close(ch)
+			ch <- llm.ChatEvent{Type: llm.EventTextDelta, Text: "identified the likely repair but could not finish"}
+			ch <- llm.ChatEvent{Type: llm.EventError, Error: evalError("agent exceeded maximum turns (20)"), Usage: &llm.Usage{InputTokens: 30, OutputTokens: 5}}
+		}()
+		return ch, nil
+	}
+	if p.codingEmptyIncomplete {
+		ch := make(chan llm.ChatEvent, 1)
+		go func() {
+			defer close(ch)
+			ch <- llm.ChatEvent{Type: llm.EventError, Error: evalError("agent exceeded maximum turns (20)")}
+		}()
+		return ch, nil
 	}
 
 	// Coding role: write a file on the first turn (creating a real diff), then
@@ -236,6 +260,64 @@ func TestRun_EvaluatorErrorFailsClosed(t *testing.T) {
 	l, db, ws := newLoop(t, repo, &scriptedProvider{evalErr: true}, bugFixCfg())
 	require.NoError(t, l.Run(context.Background(), gitCommitSignal()))
 	assert.Equal(t, loop.StatusSuggested, lastStatus(t, db, ws))
+	tasks, err := db.ListTasks(context.Background(), ws.ID, 1)
+	require.NoError(t, err)
+	events, err := db.GetTaskEvents(context.Background(), tasks[0].ID)
+	require.NoError(t, err)
+	var types []string
+	for _, event := range events {
+		types = append(types, event.Type)
+	}
+	assert.Contains(t, types, "evaluation_error")
+	assert.NotContains(t, types, "evaluation_rejected")
+	spent, err := db.SumWorkspaceTokensSince(context.Background(), ws.ID, time.Now().Add(-time.Hour))
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, spent, 50, "evaluator usage must survive the runtime error")
+}
+
+func TestRun_EvaluatorMalformedFinalVerdictIsIncomplete(t *testing.T) {
+	repo := initRepo(t)
+	l, db, ws := newLoop(t, repo, &scriptedProvider{evalMalformed: true}, bugFixCfg())
+	require.NoError(t, l.Run(context.Background(), gitCommitSignal()))
+	assert.Equal(t, loop.StatusSuggested, lastStatus(t, db, ws))
+	tasks, err := db.ListTasks(context.Background(), ws.ID, 1)
+	require.NoError(t, err)
+	events, err := db.GetTaskEvents(context.Background(), tasks[0].ID)
+	require.NoError(t, err)
+	var types []string
+	for _, event := range events {
+		types = append(types, event.Type)
+	}
+	assert.Contains(t, types, "evaluation_incomplete")
+	assert.NotContains(t, types, "evaluation_rejected")
+}
+
+func TestRun_CodingTurnExhaustionPreservesUsefulSuggestion(t *testing.T) {
+	repo := initRepo(t)
+	l, db, ws := newLoop(t, repo, &scriptedProvider{codingIncomplete: true}, bugFixCfg())
+	require.NoError(t, l.Run(context.Background(), gitCommitSignal()))
+	assert.Equal(t, loop.StatusSuggested, lastStatus(t, db, ws))
+	tasks, err := db.ListTasks(context.Background(), ws.ID, 1)
+	require.NoError(t, err)
+	events, err := db.GetTaskEvents(context.Background(), tasks[0].ID)
+	require.NoError(t, err)
+	var types []string
+	for _, event := range events {
+		types = append(types, event.Type)
+	}
+	assert.Contains(t, types, "coding_incomplete")
+	assert.Contains(t, types, "suggestion")
+	out, cmdErr := exec.Command("git", "-C", repo, "branch", "--list", "sidecar/*").Output()
+	require.NoError(t, cmdErr)
+	assert.Empty(t, strings.TrimSpace(string(out)), "incomplete coding must not deliver partial code")
+}
+
+func TestRun_CodingIncompleteWithoutUsefulOutputFails(t *testing.T) {
+	repo := initRepo(t)
+	l, db, ws := newLoop(t, repo, &scriptedProvider{codingEmptyIncomplete: true}, bugFixCfg())
+	err := l.Run(context.Background(), gitCommitSignal())
+	require.ErrorContains(t, err, "incomplete without a usable handoff")
+	assert.Equal(t, loop.StatusFailed, lastStatus(t, db, ws))
 }
 
 func TestRun_VerificationFailureFailsAndDeletesBranch(t *testing.T) {

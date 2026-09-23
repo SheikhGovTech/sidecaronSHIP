@@ -3,6 +3,9 @@ package agenttrace_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -19,6 +22,39 @@ import (
 type memorySink struct {
 	events []*store.AgentTraceEvent
 	usage  []store.AgentRequestUsage
+}
+
+type batchMemorySink struct {
+	mu      sync.Mutex
+	events  []*store.AgentTraceEvent
+	usage   []store.AgentRequestUsage
+	fail    bool
+	batches int
+}
+
+func (s *batchMemorySink) AppendAgentTraceEvent(_ context.Context, event *store.AgentTraceEvent) error {
+	return s.AppendAgentTraceEvents(context.Background(), []*store.AgentTraceEvent{event})
+}
+
+func (s *batchMemorySink) AppendAgentTraceEvents(_ context.Context, events []*store.AgentTraceEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fail {
+		return errors.New("bounded trace write failed")
+	}
+	s.batches++
+	for _, event := range events {
+		copy := *event
+		s.events = append(s.events, &copy)
+	}
+	return nil
+}
+
+func (s *batchMemorySink) RecordAgentRequestUsage(_ context.Context, usage store.AgentRequestUsage) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.usage = append(s.usage, usage)
+	return true, nil
 }
 
 func (s *memorySink) AppendAgentTraceEvent(_ context.Context, event *store.AgentTraceEvent) error {
@@ -140,4 +176,74 @@ func TestCollectorRecordsUnavailableUsage(t *testing.T) {
 	require.Len(t, sink.usage, 1)
 	assert.Nil(t, sink.usage[0].InputTokens)
 	assert.Equal(t, "unavailable", sink.usage[0].Source)
+}
+
+func TestCollectorBatchesConcurrentToolsAndTerminalFlush(t *testing.T) {
+	sink := &batchMemorySink{}
+	collector := agenttrace.New(sink, uuid.New(), "evaluator", 1, "/tmp/work", traceConfig())
+	var wg sync.WaitGroup
+	errs := make(chan error, 24)
+	for i := range 12 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			id := fmt.Sprintf("call-%d", i)
+			call := &llm.ToolCall{ID: id, Name: "read_file", Input: json.RawMessage(fmt.Sprintf(`{"path":"/tmp/work/file-%d"}`, i))}
+			errs <- collector.Handle(context.Background(), runtime.AgentEvent{Type: runtime.EventToolCallReady, ToolCall: call})
+			errs <- collector.Handle(context.Background(), runtime.AgentEvent{Type: runtime.EventToolResult, ToolCall: call, Result: &tool.ToolResult{Output: "ok"}})
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	require.NoError(t, collector.Handle(context.Background(), runtime.AgentEvent{Type: runtime.EventDone}))
+	require.NoError(t, collector.Flush(context.Background()))
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	assert.Len(t, sink.events, 25)
+	assert.Equal(t, "agent_completed", sink.events[len(sink.events)-1].EventType)
+	assert.Positive(t, sink.batches)
+	for i, event := range sink.events {
+		assert.Equal(t, int64(i+1), event.Sequence)
+	}
+}
+
+func TestCollectorCompactionAbortAndMaximumTurnError(t *testing.T) {
+	sink := &memorySink{}
+	collector := agenttrace.New(sink, uuid.New(), "coding", 1, "", traceConfig())
+	require.NoError(t, collector.Handle(context.Background(), runtime.AgentEvent{Type: runtime.EventCompactionStart}))
+	require.NoError(t, collector.Handle(context.Background(), runtime.AgentEvent{Type: runtime.EventCompactionSkipped}))
+	require.NoError(t, collector.Handle(context.Background(), runtime.AgentEvent{Type: runtime.EventError, Error: errors.New("agent exceeded maximum turns (20)")}))
+
+	types := make([]string, 0, len(sink.events))
+	for _, event := range sink.events {
+		types = append(types, event.EventType)
+	}
+	assert.Equal(t, []string{"compaction_started", "compaction_skipped", "agent_error"}, types)
+	assert.Equal(t, "error", collector.Summary().Terminal)
+}
+
+func TestCollectorRecordsCompactionCompletionAndAbort(t *testing.T) {
+	sink := &memorySink{}
+	collector := agenttrace.New(sink, uuid.New(), "reviewer", 1, "", traceConfig())
+	require.NoError(t, collector.Handle(context.Background(), runtime.AgentEvent{Type: runtime.EventCompactionStart}))
+	require.NoError(t, collector.Handle(context.Background(), runtime.AgentEvent{Type: runtime.EventCompactionDone}))
+	require.NoError(t, collector.Handle(context.Background(), runtime.AgentEvent{Type: runtime.EventAborted}))
+	require.Len(t, sink.events, 3)
+	assert.Equal(t, "compaction_completed", sink.events[1].EventType)
+	assert.Equal(t, "agent_aborted", sink.events[2].EventType)
+	assert.Equal(t, "aborted", collector.Summary().Terminal)
+}
+
+func TestCollectorReportsBoundedPersistenceFailure(t *testing.T) {
+	sink := &batchMemorySink{fail: true}
+	collector := agenttrace.New(sink, uuid.New(), "coding", 1, "", traceConfig(), "secret-value")
+	require.NoError(t, collector.Handle(context.Background(), runtime.AgentEvent{Type: runtime.EventTextDelta, Text: "secret-value"}))
+	err := collector.Handle(context.Background(), runtime.AgentEvent{Type: runtime.EventDone})
+	require.ErrorContains(t, err, "bounded trace write failed")
+	assert.Error(t, collector.Summary().PersistenceFail)
+	assert.Empty(t, sink.events)
 }

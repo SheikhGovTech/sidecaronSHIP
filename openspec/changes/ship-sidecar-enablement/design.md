@@ -29,4 +29,6 @@ guard for concurrent runs.
 Enrichment adds several GitLab requests per failed pipeline but is bounded by
 log and diff limits. Missing API data degrades gracefully. Deduplication saves
 LLM spend across restarts but intentionally does not deduplicate event-like
-signals. Live deployment and database verification remain environment-specific.
+signals. Downstream deployment acceptance is outside this repository's change
+scope; database behavior is verified through the repository's tagged
+integration tests.

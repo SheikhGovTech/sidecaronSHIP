@@ -113,15 +113,15 @@ provide every runtime, package manager, dependency, and executable declared in
 `required_tools`. Run Sidecar as an unprivileged OS user; verification uses the
 current user and never elevates privileges.
 
-Before any code ships (`auto-commit` or `pull-request`), an **adversarial evaluator** reviews the diff. It is a fresh agent session — different context from the coding agent, instructed to assume the change is broken until proven otherwise — with read and bash tools only. It runs the build and tests against the diff (anchored to the worktree's base ref, so it sees the change even if the coding agent committed it itself) and returns a verdict:
+Before any code ships (`auto-commit` or `pull-request`), an **adversarial evaluator** reviews the diff. It receives the bounded deterministic-verification evidence and performs only targeted material-risk checks. Investigation is capped below the Harness hard turn limit, equivalent commands are answered with existing evidence, and one tool-free request is reserved for verdict finalization:
 
 ```json
-{"pass": false, "reasons": "tests still fail: TestCreate expects 201, got 200"}
+{"outcome":"reject","reasons":"TestCreate still returns 200 instead of 201","evidence":["diff:handler.go"]}
 ```
 
-On **REJECT**, the change does not ship — it is recorded as a suggestion with the evaluator's reasons. An evaluator runtime failure is recorded separately as **ERROR**, never as a rejection or approval. The default error policy is `suggest`; `fail` marks the task failed, while `draft-change-request` may preserve a deterministically verified `pull-request` repair as a human-gated draft labelled `sidecar:evaluation-error`. Verification is enabled by default (`verification.enabled: true`) and applies to both `auto-commit` and `pull-request`. Setting it to `false` disables both configured commands and the evaluator. `suggest-only`, `notify`, and unchanged tasks skip commands.
+Evaluator outcomes are distinct: **PASS**, **REJECT**, **INCOMPLETE** (no valid verdict within the completion contract), and **ERROR** (provider, runtime, persistence, or cancellation failure). Neither incomplete nor error is approval. The default preservation policy is `suggest`; `fail` marks the task failed, while `draft-change-request` may preserve a deterministically verified `pull-request` repair as a human-gated draft labelled `sidecar:evaluation-incomplete`. Coding exhaustion is likewise recorded as `coding_incomplete`; useful bounded findings become a suggestion, while partial code is discarded. Verification is enabled by default (`verification.enabled: true`) and applies to both `auto-commit` and `pull-request`. Setting it to `false` disables both configured commands and the evaluator. `suggest-only`, `notify`, and unchanged tasks skip commands.
 
-Sidecar persists sanitized Harness action traces for the coding agent and evaluator. Traces contain visible assistant output, bounded tool evidence, request-level usage, and terminal outcomes—not hidden chain-of-thought, complete prompts, file bodies, or raw unbounded logs. Request usage is recorded before error policy and worktree cleanup, so evaluator spend remains visible when a run exhausts its turn limit. Generated PRs/MRs include a bounded decision summary and durable trace IDs.
+Sidecar persists sanitized Harness action traces for coding, evaluator, and reviewer runtimes. Traces contain visible assistant output, bounded tool evidence, request-level usage, and terminal outcomes—not hidden chain-of-thought, complete prompts, file bodies, or raw unbounded logs. Request usage is recorded before error policy and worktree cleanup, so evaluator spend remains visible when a run exhausts its turn limit. Generated PRs/MRs include a bounded decision summary and durable trace IDs.
 
 ### 6. Output routing
 
@@ -565,9 +565,9 @@ verification:
       working_directory: . # relative to the task worktree
       pass_env: [PATH, HOME]
 
-# Evaluator execution policy. A draft created after ERROR is explicitly
-# unapproved and requires human review; a valid REJECT still becomes a
-# suggestion.
+# Evaluator execution policy. Max turns is the final safety boundary; Sidecar
+# uses a lower investigation boundary and reserves a tool-free verdict request.
+# A preserved draft is explicitly unapproved and requires human review.
 workflow:
   evaluator:
     max_turns: 20       # default 20; maximum 50
@@ -662,6 +662,12 @@ Submit a one-off on-demand task without starting the full daemon. The agent runs
 ```bash
 sidecar task "add pagination to the /users endpoint"
 sidecar task "fix the flaky test in auth_test.go" --repo /path/to/project
+```
+
+Inspect a sanitized incomplete-work handoff and its durable trace references:
+
+```bash
+sidecar task show <task-id>
 ```
 
 ### `sidecar ask <question>`

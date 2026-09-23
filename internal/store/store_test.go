@@ -91,6 +91,9 @@ func TestTask_CreateAndList(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEmpty(t, task.ID)
 	assert.Equal(t, "pending", task.Status)
+	gotTask, err := db.GetTask(context.Background(), task.ID)
+	require.NoError(t, err)
+	assert.Equal(t, task.Summary, gotTask.Summary)
 
 	tasks, err := db.ListTasks(context.Background(), ws.ID, 10)
 	require.NoError(t, err)
@@ -206,7 +209,7 @@ func TestStoreMemory_AndSearch(t *testing.T) {
 	ws := &store.Workspace{Name: "mem-test", Path: t.TempDir(), ConfigHash: "x"}
 	require.NoError(t, db.UpsertWorkspace(context.Background(), ws))
 
-	embedding := make([]float32, 1536)
+	embedding := make([]float32, 1024)
 	embedding[0] = 1.0
 	err = db.StoreMemory(context.Background(), ws.ID, "semantic", "auth uses interface mocking", embedding)
 	require.NoError(t, err)
@@ -428,4 +431,48 @@ func TestAgentTraceEventsAndIdempotentUsage(t *testing.T) {
 	total, err := db.SumWorkspaceTokensSince(ctx, ws.ID, time.Now().Add(-time.Hour))
 	require.NoError(t, err)
 	assert.Equal(t, 120, total)
+}
+
+func TestAgentTraceBatchPaginationRetentionAndCascade(t *testing.T) {
+	db, err := store.Connect(context.Background(), dbURL(t))
+	require.NoError(t, err)
+	defer db.Close()
+	require.NoError(t, store.Migrate(context.Background(), db))
+
+	ctx := context.Background()
+	ws := &store.Workspace{Name: "trace-page", Path: t.TempDir(), ConfigHash: "h"}
+	require.NoError(t, db.UpsertWorkspace(ctx, ws))
+	task := &store.Task{WorkspaceID: ws.ID, SignalType: "ci.failure", Summary: "trace page"}
+	require.NoError(t, db.CreateTask(ctx, task))
+	traceID := uuid.New()
+	batch := make([]*store.AgentTraceEvent, 3)
+	for i := range batch {
+		batch[i] = &store.AgentTraceEvent{TaskID: task.ID, TraceID: traceID, Role: "coding", Attempt: 1,
+			Sequence: int64(i + 1), EventType: "tool_call", Payload: map[string]any{"index": i + 1}}
+	}
+	require.NoError(t, db.AppendAgentTraceEvents(ctx, batch))
+
+	page, err := db.ListAgentTraceEventsPage(ctx, store.AgentTraceQuery{
+		TaskID: task.ID, TraceID: &traceID, Role: "coding", AfterSequence: 1, Limit: 1,
+	})
+	require.NoError(t, err)
+	require.Len(t, page, 1)
+	assert.Equal(t, int64(2), page[0].Sequence)
+	_, err = db.ListAgentTraceEventsPage(ctx, store.AgentTraceQuery{TaskID: task.ID, AfterSequence: 1})
+	assert.Error(t, err)
+
+	_, err = db.Pool().Exec(ctx, `UPDATE agent_trace_events SET created_at=$1 WHERE trace_id=$2`, time.Now().Add(-48*time.Hour), traceID)
+	require.NoError(t, err)
+	deleted, err := db.DeleteAgentTraceEventsBefore(ctx, ws.ID, time.Now().Add(-24*time.Hour), 2)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), deleted)
+	remaining, err := db.ListAgentTraceEvents(ctx, task.ID, 10)
+	require.NoError(t, err)
+	require.Len(t, remaining, 1)
+
+	_, err = db.Pool().Exec(ctx, `DELETE FROM tasks WHERE id=$1`, task.ID)
+	require.NoError(t, err)
+	var count int
+	require.NoError(t, db.Pool().QueryRow(ctx, `SELECT count(*) FROM agent_trace_events WHERE task_id=$1`, task.ID).Scan(&count))
+	assert.Zero(t, count)
 }

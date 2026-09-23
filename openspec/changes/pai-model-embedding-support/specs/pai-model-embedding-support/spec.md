@@ -25,6 +25,11 @@ the endpoint is unset, existing provider defaults SHALL remain unchanged.
 The provider SHALL pass model identifiers such as `bedrock.claude-sonnet-4-5`
 unchanged to the compatible endpoint.
 
+#### Scenario: Gateway model identifier
+
+- **WHEN** a PAi model identifier is configured for an agent role
+- **THEN** Sidecar sends that exact identifier in the model request
+
 ### Requirement: PAi-compatible embeddings
 
 The embedding layer SHALL support an OpenAI-compatible `/v1/embeddings`
@@ -67,14 +72,25 @@ The project SHALL document endpoint, credential, provider, model, dimension,
 and input-type configuration and SHALL provide unit tests for request routing,
 authentication, model propagation, response parsing, and dimension handling.
 
+#### Scenario: Provider configuration is maintained
+
+- **WHEN** compatible gateway support changes
+- **THEN** repository documentation describes its configuration
+- **AND** repository tests cover endpoint routing, authentication, model
+  propagation, response parsing, and dimensions
+
 ### Requirement: No database migration for provider support
 
 The change SHALL not require a database migration for supported 1024-dimensional
 providers. Providers returning another dimension SHALL be rejected or handled
 explicitly rather than writing vectors incompatible with `vector(1024)`.
 
-### Requirement: Downstream overlay removal path
+#### Scenario: Supported vector dimensions
 
-After the upstream capability is merged and adopted, downstream deployments
-SHALL be able to remove their local `cohere.go` and `embedding.go` Docker
-overlays without losing provider functionality.
+- **WHEN** a configured provider returns 1024-dimensional vectors
+- **THEN** Sidecar stores them without a provider-specific schema migration
+
+#### Scenario: Incompatible vector dimensions
+
+- **WHEN** a provider returns vectors incompatible with the configured schema
+- **THEN** Sidecar returns an error before storing them

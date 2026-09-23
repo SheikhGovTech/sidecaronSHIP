@@ -3,7 +3,7 @@
 ## Schema and configuration
 
 - [x] Add the idempotent `agent_trace_events` table and indexes.
-- [ ] Add store methods for batched append, bounded ordered retrieval, and
+- [x] Add store methods for batched append, bounded ordered retrieval, and
       bounded retention deletion.
 - [x] Add trace configuration, defaults, enum validation, 64-KiB output cap,
       and 1–365-day retention bounds for YAML and public Go configuration.
@@ -34,12 +34,12 @@
 - [x] Persist compaction lifecycle without compaction summary text.
 - [x] Persist completed, aborted, and error terminal events and always drain the
       Harness event channel.
-- [ ] Add bounded batching/backpressure and safe trace-persistence failure
+- [x] Add bounded batching/backpressure and safe trace-persistence failure
       reporting with no raw-log fallback.
 
 ## Sidecar integration and accounting
 
-- [ ] Wire tracing into coding, evaluator, and reviewer runtime consumers.
+- [x] Wire tracing into coding, evaluator, and reviewer runtime consumers.
 - [x] Emit safe INFO tool activity with task/trace/role/tool/duration/exit only.
 - [x] Replace terminal-only evaluator accounting with per-request idempotent
       usage persistence before evaluator policy and worktree cleanup.
@@ -49,19 +49,19 @@
       persistence failure.
 - [x] Record evaluator pass, rejection, and runtime error as distinct outcomes
       and remove misleading rejection logs for error paths.
-- [ ] Add the bounded daily trace-retention job.
+- [x] Add the bounded daily trace-retention job.
 
 ## Tests and documentation
 
-- [ ] Add schema/store integration tests for ordering, idempotent usage,
+- [x] Add schema/store integration tests for ordering, idempotent usage,
       pagination, cascade deletion, and retention batches.
 - [x] Add unit tests for nested redaction, known-secret values, malformed JSON,
       UTF-8 truncation, command hashes, file paths, and binary omission.
-- [ ] Add collector tests for concurrent tools, request boundaries, compaction,
+- [x] Add collector tests for concurrent tools, request boundaries, compaction,
       completion, abort, maximum-turn error, and channel draining.
-- [ ] Add evaluator-error integration coverage proving usage survives failure,
+- [x] Add evaluator-error integration coverage proving usage survives failure,
       budget totals include it once, and the outcome is not a rejection.
-- [ ] Add tests proving hidden reasoning, prompts, raw CI logs, file bodies, and
+- [x] Add tests proving hidden reasoning, prompts, raw CI logs, file bodies, and
       credentials are never persisted or logged.
 - [x] Document configuration, trace schema, privacy boundary, retention,
       retrieval, and the Sidecar/Harness responsibility split.

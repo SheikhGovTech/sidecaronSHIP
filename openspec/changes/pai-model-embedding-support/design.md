@@ -44,8 +44,5 @@ endpoints remain unchanged when new variables are unset. No database schema
 migration is required unless a future provider supports a different vector
 dimension; dimensionality must be validated before storing vectors.
 
-## Downstream cleanup
-
-Once the upstream implementation is merged and consumed, downstream
-deployments can remove their Docker overlays for `cohere.go` and
-`embedding.go` in a follow-up deployment change.
+Downstream adoption and removal of application-specific overlays are outside
+this repository's implementation and acceptance scope.

@@ -45,6 +45,19 @@ func (db *DB) UpdateTaskStatus(ctx context.Context, id uuid.UUID, status string)
 	return nil
 }
 
+// GetTask returns one task by ID.
+func (db *DB) GetTask(ctx context.Context, id uuid.UUID) (*Task, error) {
+	t := &Task{}
+	err := db.pool.QueryRow(ctx, `
+		SELECT id, workspace_id, signal_type, status, summary, signal_key, created_at, updated_at
+		FROM tasks WHERE id=$1`, id).Scan(&t.ID, &t.WorkspaceID, &t.SignalType, &t.Status,
+		&t.Summary, &t.SignalKey, &t.CreatedAt, &t.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("getting task %s: %w", id, err)
+	}
+	return t, nil
+}
+
 func (db *DB) ListTasks(ctx context.Context, workspaceID uuid.UUID, limit int) ([]*Task, error) {
 	rows, err := db.pool.Query(ctx, `
 		SELECT id, workspace_id, signal_type, status, summary, signal_key, created_at, updated_at

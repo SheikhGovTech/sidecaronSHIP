@@ -9,9 +9,11 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/sausheong/harness/llm"
 	"github.com/sausheong/harness/providers/anthropic"
 	"github.com/sausheong/harness/runtime"
@@ -22,6 +24,7 @@ import (
 	"github.com/sausheong/harness/tools/file"
 	"github.com/sausheong/sidecar/internal/adapter"
 	"github.com/sausheong/sidecar/internal/agenttrace"
+	"github.com/sausheong/sidecar/internal/completion"
 	"github.com/sausheong/sidecar/internal/config"
 	"github.com/sausheong/sidecar/internal/evaluate"
 	"github.com/sausheong/sidecar/internal/memory"
@@ -156,15 +159,17 @@ func errString(err error) string {
 // Loop is the core improvement loop that wraps a Harness runtime invocation
 // for a single incoming Signal.
 type Loop struct {
-	db         *store.DB
-	workspace  *store.Workspace
-	cfg        *config.Config
-	repoPath   string
-	provider   llm.LLMProvider
-	embedding  memory.EmbeddingProvider // nil when memory is not configured
-	memTool    *harnessmem.MemoryTool   // nil when embedding is nil
-	dispatcher *notify.Dispatcher       // nil when no notifications configured
-	skills     runtime.SkillProvider    // nil when no skills dir present
+	db          *store.DB
+	workspace   *store.Workspace
+	cfg         *config.Config
+	repoPath    string
+	provider    llm.LLMProvider
+	embedding   memory.EmbeddingProvider // nil when memory is not configured
+	memTool     *harnessmem.MemoryTool   // nil when embedding is nil
+	dispatcher  *notify.Dispatcher       // nil when no notifications configured
+	skills      runtime.SkillProvider    // nil when no skills dir present
+	retentionMu sync.Mutex
+	retainedAt  time.Time
 }
 
 // New constructs a Loop. Pass nil for embedding to disable memory retrieval and reviewer-driven memory writes.
@@ -180,12 +185,19 @@ func New(db *store.DB, workspace *store.Workspace, cfg *config.Config, repoPath 
 		workspace:  workspace,
 		cfg:        cfg,
 		repoPath:   repoPath,
-		provider:   anthropic.NewAnthropicProvider(os.Getenv("ANTHROPIC_API_KEY"), os.Getenv("ANTHROPIC_BASE_URL")),
+		provider:   newLLMProvider(os.Getenv("ANTHROPIC_API_KEY"), os.Getenv("ANTHROPIC_BASE_URL")),
 		embedding:  embedding,
 		memTool:    memTool,
 		dispatcher: notify.NewDispatcher(cfg.Notifications),
 		skills:     skills,
 	}
+}
+
+// newLLMProvider centralizes construction of the Anthropic-compatible client.
+// Model identifiers are deliberately not interpreted here: compatible
+// gateways receive the exact model string selected by the caller.
+func newLLMProvider(apiKey, baseURL string) llm.LLMProvider {
+	return anthropic.NewAnthropicProvider(apiKey, baseURL)
 }
 
 // Run executes the improvement loop for the given signal:
@@ -217,11 +229,7 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		return fmt.Errorf("creating task: %w", err)
 	}
 	traceCfg := l.cfg.EffectiveAgentTraces()
-	if traceCfg.RetentionDays > 0 {
-		if _, err := l.db.DeleteAgentTraceEventsBefore(ctx, l.workspace.ID, time.Now().UTC().AddDate(0, 0, -traceCfg.RetentionDays), 1000); err != nil {
-			slog.Warn("agent trace retention cleanup failed", "err", err)
-		}
-	}
+	l.runTraceRetention(ctx, task.ID, traceCfg)
 
 	// ── Budget gate ──────────────────────────────────────────────────────────
 	// Checked before any LLM spend. Fails OPEN: a metering error allows the run
@@ -418,6 +426,7 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 
 	codingTrace := agenttrace.New(l.db, task.ID, "coding", 1, workDir, traceCfg, l.traceSecrets()...)
 	var agentErr, traceErr error
+	codingTerminal := ""
 	var textBuf strings.Builder
 	var codingUsage UsageTotals
 	for ev := range events {
@@ -429,11 +438,19 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		}
 		if ev.Type == runtime.EventError {
 			agentErr = ev.Error
+			codingTerminal = "error"
+		} else if ev.Type == runtime.EventDone {
+			codingTerminal = "completed"
+		} else if ev.Type == runtime.EventAborted {
+			codingTerminal = "aborted"
 		}
 		if ev.Type == runtime.EventTextDelta {
 			textBuf.WriteString(ev.Text)
 		}
 		AccumulateUsage(&codingUsage, ev)
+	}
+	if flushErr := codingTrace.Flush(ctx); traceErr == nil && flushErr != nil {
+		traceErr = flushErr
 	}
 	codingEvidence := codingTrace.Summary()
 	safeCodingSummary := codingEvidence.Text
@@ -447,18 +464,44 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		})
 	}
 	if traceErr != nil {
-		_ = l.db.AppendTaskEvent(ctx, task.ID, "trace_persistence_failed", map[string]any{"role": "coding", "error": traceErr.Error()})
+		_ = l.db.AppendTaskEvent(ctx, task.ID, "trace_persistence_failed", map[string]any{"role": "coding", "error": agenttrace.Redact(traceErr.Error(), l.traceSecrets()...)})
 		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
 		l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
 		l.discardWorktree(task.ID.String(), wt, &wtCleanup)
 		return fmt.Errorf("persisting coding-agent trace: %w", traceErr)
 	}
-	if agentErr != nil {
+	if agentErr != nil && !isTurnExhaustion(agentErr) {
 		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
 		l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
 		l.discardWorktree(task.ID.String(), wt, &wtCleanup)
 		return fmt.Errorf("agent error: %w", agentErr)
 	}
+	codingBaseRef := ""
+	if wt != nil {
+		codingBaseRef = wt.Base
+	}
+	codingChanged := false
+	if ShipsCode(tr.AutonomyLevel) {
+		var changeErr error
+		codingChanged, changeErr = workspaceHasChanges(workDir, codingBaseRef)
+		if changeErr != nil {
+			return l.failVerification(ctx, sig, task, wt, &wtCleanup, "change_detection", verification.Result{Err: changeErr})
+		}
+	}
+	if codingTerminal != "completed" || (codingChanged && strings.TrimSpace(safeCodingSummary) == "") || (!codingChanged && strings.TrimSpace(safeCodingSummary) == "") {
+		stopReason := codingTerminal
+		if agentErr != nil {
+			stopReason = agenttrace.Redact(agentErr.Error(), l.traceSecrets()...)
+		}
+		return l.handleCodingIncomplete(ctx, sig, task, wt, &wtCleanup, safeCodingSummary, stopReason, codingEvidence)
+	}
+	codingOutcome := completion.CodingNoChange
+	if codingChanged {
+		codingOutcome = completion.CodingChanged
+	}
+	_ = l.db.AppendTaskEvent(ctx, task.ID, "coding_completed", (completion.StageResult{Outcome: codingOutcome,
+		StopReason: codingTerminal, Attempt: 1, RequestsUsed: codingEvidence.Requests,
+		TraceID: codingEvidence.TraceID, Summary: safeCodingSummary}).Payload())
 
 	var evaluatorEvidence agenttrace.Summary
 	var verificationEvidence []verification.Result
@@ -471,10 +514,7 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		// Anchor the diff to the worktree base ref so the evaluator sees the
 		// agent's changes even if it self-committed (HEAD would have moved).
 		// In the in-repo fallback (wt == nil) baseRef is "" → Evaluate uses HEAD.
-		baseRef := ""
-		if wt != nil {
-			baseRef = wt.Base
-		}
+		baseRef := codingBaseRef
 		changed, changeErr := workspaceHasChanges(workDir, baseRef)
 		if changeErr != nil {
 			return l.failVerification(ctx, sig, task, wt, &wtCleanup, "change_detection", verification.Result{Err: changeErr})
@@ -493,8 +533,12 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 			}
 
 			evaluatorTrace := agenttrace.New(l.db, task.ID, "evaluator", 1, workDir, traceCfg, l.traceSecrets()...)
-			verdict, evalUsage, evalErr := evaluate.EvaluateObserved(ctx, l.provider, models.Evaluator, workDir, baseRef,
-				task.Summary, verificationCommands, l.cfg.EvaluatorMaxTurns(), evaluatorTrace.Handle)
+			evaluatorInput := sanitizeVerificationEvidence(verificationEvidence, l.traceSecrets()...)
+			verdict, evalUsage, evalErr := evaluate.EvaluateObservedWithEvidence(ctx, l.provider, models.Evaluator, workDir, baseRef,
+				task.Summary, verificationCommands, evaluatorInput, l.cfg.EvaluatorMaxTurns(), evaluatorTrace.Handle)
+			if flushErr := evaluatorTrace.Flush(ctx); flushErr != nil && evalErr == nil {
+				evalErr = fmt.Errorf("persisting evaluator trace: %w", flushErr)
+			}
 			evaluatorEvidence = evaluatorTrace.Summary()
 			safeEvalErr := ""
 			if evalErr != nil {
@@ -511,17 +555,33 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 				})
 			}
 			evaluationPayload := map[string]any{
-				"pass":     verdict.Pass,
-				"reasons":  verdict.Reasons,
-				"model":    models.Evaluator,
-				"error":    safeEvalErr,
-				"trace_id": evaluatorEvidence.TraceID.String(),
+				"outcome": verdict.Outcome, "pass": verdict.Pass,
+				"reasons": verdict.Reasons, "evidence": verdict.Evidence,
+				"model": models.Evaluator, "error": safeEvalErr,
+				"trace_id": evaluatorEvidence.TraceID.String(), "attempt": 1,
+				"requests_used": evaluatorEvidence.Requests, "repeated_tools": evaluatorEvidence.RepeatedTools,
 			}
 			_ = l.db.AppendTaskEvent(ctx, task.ID, "evaluation", evaluationPayload)
 			if evalErr != nil {
+				incomplete := evaluate.IsIncomplete(evalErr)
 				evaluationStatus, evaluationReasons = "error", safeEvalErr
-				_ = l.db.AppendTaskEvent(ctx, task.ID, "evaluation_error", evaluationPayload)
-				slog.Warn("evaluator runtime error", "err", evalErr, "task", task.ID)
+				eventType := "evaluation_error"
+				if incomplete {
+					evaluationStatus = "incomplete"
+					eventType = "evaluation_incomplete"
+				}
+				evaluationPayload["outcome"] = evaluationStatus
+				evaluationPayload["stop_reason"] = safeEvalErr
+				evaluationPayload["attempt"] = 1
+				evaluationPayload["requests_used"] = evaluatorEvidence.Requests
+				_ = l.db.AppendTaskEvent(ctx, task.ID, eventType, evaluationPayload)
+				if incomplete {
+					slog.Warn("evaluator incomplete", "err", evalErr, "task", task.ID)
+					_ = l.db.AppendTaskEvent(ctx, task.ID, "incomplete_handoff",
+						incompleteHandoff(task.ID, completion.EvaluationIncomplete, safeCodingSummary, safeEvalErr, evaluatorEvidence.TraceID, verificationEvidence))
+				} else {
+					slog.Warn("evaluator runtime error", "err", evalErr, "task", task.ID)
+				}
 				if l.cfg.EvaluatorOnError() == "draft-change-request" && tr.AutonomyLevel == "pull-request" {
 					draftChangeRequest = true
 				} else if l.cfg.EvaluatorOnError() == "fail" {
@@ -530,9 +590,15 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 					l.discardWorktree(task.ID.String(), wt, &wtCleanup)
 					return fmt.Errorf("evaluator: %w", evalErr)
 				} else {
-					_ = l.db.AppendTaskEvent(ctx, task.ID, "suggestion", map[string]any{"summary": safeCodingSummary, "evaluation_error": safeEvalErr})
+					handoff := incompleteHandoff(task.ID, completion.EvaluationIncomplete, safeCodingSummary, safeEvalErr, evaluatorEvidence.TraceID, verificationEvidence)
+					if !incomplete {
+						handoff["reason"] = completion.EvaluationError
+					}
+					_ = l.db.AppendTaskEvent(ctx, task.ID, "suggestion", handoff)
 					_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusSuggested)
-					l.dispatcher.Fire(ctx, notify.EventSuggested, sig, task)
+					notifyTask := *task
+					notifyTask.Summary = handoffNotification(handoff)
+					l.dispatcher.Fire(ctx, notify.EventSuggested, sig, &notifyTask)
 					l.discardWorktree(task.ID.String(), wt, &wtCleanup)
 					return nil
 				}
@@ -606,7 +672,7 @@ func (l *Loop) Run(ctx context.Context, sig adapter.Signal) error {
 		}
 		labels := []string(nil)
 		if draftChangeRequest {
-			labels = []string{"sidecar:evaluation-error"}
+			labels = []string{"sidecar:evaluation-incomplete"}
 		}
 		result, publishErr := output.NewPublisher(target).Publish(ctx, output.PublishRequest{
 			RepoPath: l.repoPath,
@@ -726,6 +792,62 @@ func (l *Loop) failVerification(ctx context.Context, sig adapter.Signal, task *s
 	return fmt.Errorf("verification %q failed with exit code %d", command, result.ExitCode)
 }
 
+func isTurnExhaustion(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "maximum turns")
+}
+
+func (l *Loop) handleCodingIncomplete(ctx context.Context, sig adapter.Signal, task *store.Task, wt *worktree.Worktree, cleanup *func() error, summary, stopReason string, trace agenttrace.Summary) error {
+	payload := incompleteHandoff(task.ID, completion.CodingIncomplete, summary, stopReason, trace.TraceID, nil)
+	payload["attempt"] = 1
+	payload["requests_used"] = trace.Requests
+	_ = l.db.AppendTaskEvent(ctx, task.ID, "coding_incomplete", payload)
+	l.discardWorktree(task.ID.String(), wt, cleanup)
+	if strings.TrimSpace(summary) == "" {
+		_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusFailed)
+		l.dispatcher.Fire(ctx, notify.EventFailed, sig, task)
+		return fmt.Errorf("coding agent incomplete without a usable handoff: %s", stopReason)
+	}
+	_ = l.db.AppendTaskEvent(ctx, task.ID, "suggestion", payload)
+	_ = l.db.UpdateTaskStatus(ctx, task.ID, StatusSuggested)
+	notifyTask := *task
+	notifyTask.Summary = handoffNotification(payload)
+	l.dispatcher.Fire(ctx, notify.EventSuggested, sig, &notifyTask)
+	return nil
+}
+
+func incompleteHandoff(taskID uuid.UUID, reason completion.Outcome, summary, stopReason string, traceID uuid.UUID, checks []verification.Result) map[string]any {
+	completed := []string{}
+	for _, check := range checks {
+		if check.Err == nil && check.ExitCode == 0 {
+			completed = append(completed, fmt.Sprintf("deterministic verification passed: %s", check.Name))
+		}
+	}
+	if strings.TrimSpace(summary) != "" {
+		completed = append(completed, "bounded agent summary captured")
+	}
+	return (completion.Handoff{Reason: reason, Summary: summary, StopReason: stopReason,
+		Completed: completed, Remaining: []string{"human review of incomplete stage"},
+		RecommendedAction: "Review the bounded evidence and continue the task manually.",
+		TaskID:            taskID, TraceID: traceID}).Payload()
+}
+
+func handoffNotification(handoff map[string]any) string {
+	return boundEvidence(fmt.Sprintf("%s: %s Recommended action: %s Task: %s Trace: %s",
+		handoff["reason"], handoff["summary"], handoff["recommended_action"], handoff["task_id"], handoff["trace_id"]), 4096)
+}
+
+func sanitizeVerificationEvidence(results []verification.Result, secrets ...string) []verification.Result {
+	clean := make([]verification.Result, len(results))
+	copy(clean, results)
+	for i := range clean {
+		clean[i].Output = boundEvidence(agenttrace.Redact(clean[i].Output, secrets...), 4096)
+		if clean[i].Err != nil {
+			clean[i].Err = errors.New(agenttrace.Redact(clean[i].Err.Error(), secrets...))
+		}
+	}
+	return clean
+}
+
 func (l *Loop) discardWorktree(taskID string, wt *worktree.Worktree, cleanup *func() error) {
 	if wt == nil {
 		return
@@ -760,6 +882,8 @@ func (l *Loop) runReview(parent *runtime.Runtime, task store.Task) {
 
 	reviewerReg := tool.NewRegistry()
 	reviewerReg.Register(l.memTool)
+	reviewerTrace := agenttrace.New(l.db, task.ID, "reviewer", 1, parent.Workspace, l.cfg.EffectiveAgentTraces(), l.traceSecrets()...)
+	var traceErr error
 
 	res := runtime.Review(ctx, parent, runtime.ReviewSpec{
 		Prompt:   buildReviewerPrompt(task, events),
@@ -767,12 +891,48 @@ func (l *Loop) runReview(parent *runtime.Runtime, task store.Task) {
 		Model:    ResolveModels(l.cfg).Triage,
 		MaxTurns: 4,
 		Timeout:  60 * time.Second,
+		OnEvent: func(event runtime.AgentEvent) {
+			if traceErr == nil {
+				traceErr = reviewerTrace.Handle(ctx, event)
+			}
+		},
 	})
+	if flushErr := reviewerTrace.Flush(ctx); traceErr == nil {
+		traceErr = flushErr
+	}
+	if traceErr != nil {
+		_ = l.db.AppendTaskEvent(ctx, task.ID, "trace_persistence_failed", map[string]any{"role": "reviewer", "error": agenttrace.Redact(traceErr.Error(), l.traceSecrets()...)})
+		slog.Warn("review trace persistence failed", "err", traceErr, "task", task.ID)
+	}
 	if res.Err != nil {
 		slog.Warn("review failed", "err", res.Err, "task", task.ID)
 		return
 	}
 	slog.Info("review completed", "task", task.ID, "actions", len(res.Actions))
+}
+
+// runTraceRetention performs at most one bounded cleanup batch per Loop per
+// day. It is triggered by task activity so embedding applications do not need
+// a separate scheduler.
+func (l *Loop) runTraceRetention(ctx context.Context, taskID uuid.UUID, cfg config.AgentTraceConfig) {
+	if cfg.RetentionDays <= 0 {
+		return
+	}
+	l.retentionMu.Lock()
+	defer l.retentionMu.Unlock()
+	if !l.retainedAt.IsZero() && time.Since(l.retainedAt) < 24*time.Hour {
+		return
+	}
+	deleted, err := l.db.DeleteAgentTraceEventsBefore(ctx, l.workspace.ID, time.Now().UTC().AddDate(0, 0, -cfg.RetentionDays), 1000)
+	if err != nil {
+		slog.Warn("agent trace retention cleanup failed", "err", err)
+		_ = l.db.AppendTaskEvent(ctx, taskID, "trace_retention_failed", map[string]any{"error": agenttrace.Redact(err.Error(), l.traceSecrets()...)})
+		return
+	}
+	l.retainedAt = time.Now()
+	if deleted > 0 {
+		slog.Info("expired agent traces deleted", "workspace", l.workspace.ID, "rows", deleted)
+	}
 }
 
 // resolveRepoAndToken looks up the repo slug and resolved token for a signal.
@@ -832,7 +992,7 @@ func (l *Loop) prBody(sig adapter.Signal, tr triage.TriageResult, taskID string,
 	} else {
 		fmt.Fprintf(&body, "- Outcome: `%s`\n- Trace: not available\n", evaluationStatus)
 	}
-	if evaluationStatus == "error" {
+	if evaluationStatus == "error" || evaluationStatus == "incomplete" {
 		body.WriteString("\n> **Human review required:** deterministic verification passed, but evaluator execution did not complete. This change request is not evaluator-approved.\n")
 	}
 	if evaluator.Text != "" {

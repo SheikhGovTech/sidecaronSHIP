@@ -27,6 +27,12 @@ type Sink interface {
 	RecordAgentRequestUsage(context.Context, store.AgentRequestUsage) (bool, error)
 }
 
+type batchSink interface {
+	AppendAgentTraceEvents(context.Context, []*store.AgentTraceEvent) error
+}
+
+const maxPendingEvents = 32
+
 type toolStart struct {
 	started         time.Time
 	requestSequence int
@@ -64,6 +70,7 @@ type Collector struct {
 	tools     map[string]toolStart
 	repeats   map[string]int
 	text      strings.Builder
+	pending   []*store.AgentTraceEvent
 	summary   Summary
 }
 
@@ -127,13 +134,19 @@ func (c *Collector) Handle(ctx context.Context, ev runtime.AgentEvent) error {
 			return err
 		}
 		c.summary.Terminal = "completed"
-		return c.append(ctx, "agent_completed", "", "", aggregateUsage(ev.Usage))
+		if err := c.append(ctx, "agent_completed", "", "", aggregateUsage(ev.Usage)); err != nil {
+			return err
+		}
+		return c.flushPending(ctx)
 	case runtime.EventAborted:
 		if err := c.flushText(ctx); err != nil {
 			return err
 		}
 		c.summary.Terminal = "aborted"
-		return c.append(ctx, "agent_aborted", "", "", map[string]any{})
+		if err := c.append(ctx, "agent_aborted", "", "", map[string]any{}); err != nil {
+			return err
+		}
+		return c.flushPending(ctx)
 	case runtime.EventError:
 		if err := c.flushText(ctx); err != nil {
 			return err
@@ -143,7 +156,10 @@ func (c *Collector) Handle(ctx context.Context, ev runtime.AgentEvent) error {
 			message = c.redact(ev.Error.Error())
 		}
 		c.summary.Terminal, c.summary.TerminalError = "error", message
-		return c.append(ctx, "agent_error", "", "", map[string]any{"category": errorCategory(message), "message": message})
+		if err := c.append(ctx, "agent_error", "", "", map[string]any{"category": errorCategory(message), "message": message}); err != nil {
+			return err
+		}
+		return c.flushPending(ctx)
 	default:
 		return nil
 	}
@@ -273,13 +289,45 @@ func (c *Collector) flushText(ctx context.Context) error {
 
 func (c *Collector) append(ctx context.Context, eventType, callID, toolName string, payload map[string]any) error {
 	c.sequence++
-	err := c.sink.AppendAgentTraceEvent(ctx, &store.AgentTraceEvent{TaskID: c.taskID, TraceID: c.traceID,
+	event := &store.AgentTraceEvent{TaskID: c.taskID, TraceID: c.traceID,
 		Role: c.role, Attempt: c.attempt, Sequence: c.sequence, EventType: eventType,
-		ToolCallID: callID, ToolName: toolName, Payload: payload})
+		ToolCallID: callID, ToolName: toolName, Payload: payload}
+	if _, ok := c.sink.(batchSink); ok {
+		c.pending = append(c.pending, event)
+		if len(c.pending) < maxPendingEvents {
+			return nil
+		}
+		return c.flushPending(ctx)
+	}
+	err := c.sink.AppendAgentTraceEvent(ctx, event)
 	if err != nil {
 		return c.fail(err)
 	}
 	return nil
+}
+
+func (c *Collector) flushPending(ctx context.Context) error {
+	if len(c.pending) == 0 {
+		return nil
+	}
+	sink, ok := c.sink.(batchSink)
+	if !ok {
+		return nil
+	}
+	batch := append([]*store.AgentTraceEvent(nil), c.pending...)
+	c.pending = c.pending[:0]
+	if err := sink.AppendAgentTraceEvents(ctx, batch); err != nil {
+		return c.fail(err)
+	}
+	return nil
+}
+
+// Flush persists any non-terminal buffered trace events. Runtime consumers
+// call this after draining even if Harness failed to emit a terminal event.
+func (c *Collector) Flush(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.flushPending(ctx)
 }
 
 func (c *Collector) fail(err error) error {

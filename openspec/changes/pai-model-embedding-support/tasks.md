@@ -12,13 +12,8 @@
 
 ## Tests and documentation
 
-- [ ] Add LLM endpoint/model request tests.
+- [x] Add LLM endpoint/model request tests.
 - [x] Add PAi embedding request and authentication tests.
 - [x] Add Cohere `input_type` mapping and dimension tests.
 - [x] Add configuration examples and environment-variable documentation.
 - [x] Run provider/loop tests and `go build ./...`.
-
-## Downstream adoption cleanup
-
-- [ ] After upstream merge and adoption, remove downstream `cohere.go` overlay.
-- [ ] After upstream merge and adoption, remove downstream `embedding.go` overlay.

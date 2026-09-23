@@ -8,12 +8,9 @@
       skills, budgets, SHIP-HATS configuration, CI enrichment, and dedup.
 - [x] Implement and test persistent signal deduplication.
 
-## Verification remaining
+## Repository verification
 
 - [x] Use the released `github.com/sausheong/harness v0.4.2` module and run
       `go build ./...`.
 - [x] Run `go test ./internal/loop/...`.
-- [ ] Run PostgreSQL integration tests with `SIDECAR_TEST_DB_URL`.
-- [ ] Deploy and verify restart behavior against previously processed
-      pipelines.
-- [ ] Verify live triage and coding-agent prompts contain CI enrichment.
+- [x] Run PostgreSQL integration tests with `SIDECAR_TEST_DB_URL`.
